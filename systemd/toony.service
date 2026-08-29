@@ -1,0 +1,18 @@
+# Installed to ~/.config/systemd/user/toony.service by `toony install`,
+# which rewrites ExecStart with the absolute path to your toony binary.
+[Unit]
+Description=Toony voice assistant
+After=graphical-session.target pipewire.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/toony run
+Restart=on-failure
+RestartSec=3
+# Loading a Whisper model on a cold page cache can take a while.
+TimeoutStartSec=120
+Slice=session.slice
+
+[Install]
+WantedBy=graphical-session.target default.target

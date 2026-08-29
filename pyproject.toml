@@ -1,0 +1,47 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toony"
+version = "0.1.0"
+description = "Toony — a voice assistant for the Linux desktop"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+classifiers = [
+    "Environment :: X11 Applications",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+# Only what the daemon needs to open a microphone and a speaker. Every model
+# backend is an extra, so you install exactly the ones you use.
+dependencies = [
+    "sounddevice>=0.4.6",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+claude = ["anthropic>=1.0"]
+openai = ["openai>=1.30"]          # also covers Ollama and any compatible endpoint
+local = ["faster-whisper>=1.0"]    # local speech recognition
+wake = ["openwakeword>=0.6"]       # "hey Toony"
+vad = ["webrtcvad>=2.0.10"]        # sharper endpointing than the energy gate
+piper = ["piper-tts>=1.2"]         # local speech synthesis
+# The setup this project is built for: local ears and voice, cloud brain.
+recommended = [
+    "toony[openai,local,piper]",
+]
+all = [
+    "toony[claude,openai,local,wake,vad,piper]",
+]
+
+[project.scripts]
+toony = "toony.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["toony*"]
+
+[tool.setuptools.package-data]
+toony = ["../systemd/*.service"]
