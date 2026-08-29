@@ -12,11 +12,15 @@ microphone and speaker plumbing is fixed.
    hotkey ─┐
            ├─► record ─► speech-to-text ─►  BRAIN  ─► tools ─► speech ─► 🔊
 "hey Toony"─┘             whisper/cloud    claude      │       piper/cloud
-                                           openai      │
+   window ─┘                               openai      │
                                            ollama      ▼
                                                   permission gate
                                                   (allow / ask / deny)
 ```
+
+There is a window too — a tray icon that is always there, conversations you can
+scroll back through, every setting editable in place, and Allow/Deny buttons so
+a permission question does not have to be answered by shouting "yes" at a laptop.
 
 ## Install
 
@@ -41,7 +45,105 @@ tells you exactly what to install for the parts that are missing.
 On Fedora KDE the optional desktop commands are:
 
 ```bash
-sudo dnf install wireplumber playerctl spectacle wl-clipboard libnotify brightnessctl
+sudo dnf install wireplumber playerctl spectacle wl-clipboard libnotify \
+    brightnessctl NetworkManager-tui bluez power-profiles-daemon
+```
+
+## Local or cloud, in one command
+
+```bash
+toony use                # what is running right now
+toony use local          # everything on this laptop: no key, no network
+toony use hybrid         # local ears and voice, cloud brain — the fast good one
+toony use cloud          # best models everywhere, billed to your key
+toony use claude --model claude-opus-5
+```
+
+Each preset sets the brain, the ears, the voice and the vision model together,
+then reloads the running daemon. `toony use` on its own prints the stack and
+tells you if the API key it needs is missing.
+
+## Personality
+
+```bash
+toony personality spicy
+```
+
+| | |
+|---|---|
+| `plain` | answers, nothing else |
+| `friendly` | warm and quick, a joke when something is actually funny (default) |
+| `spicy` | funny, sarcastic, teases you about your own habits |
+| `custom` | whatever you put in `general.personality_prompt` |
+
+Spicy still answers first — the joke rides along with the answer, one line, and
+it drops the act entirely when something is genuinely broken. It punches at the
+situation, the machine and your forty open tabs, never at anybody's identity.
+
+## Programming assistant
+
+```bash
+toony config set general.focus coding
+toony config set tools.code.root ~/Projects
+```
+
+That adds programming guidance to the prompt and points the code tools at your
+workspace. Everything they touch must live under that root — a path that
+resolves outside it is refused, symlinks included.
+
+| tool | |
+|---|---|
+| `list_projects`, `describe_project` | what you are working on, language, git state |
+| `read_code`, `list_files`, `search_code` | look before answering; a bare filename is found for you |
+| `write_code`, `edit_code` | make the change — the previous version is kept alongside |
+| `run_in_project` | `pytest`, `cargo check`, `npm test` — allowlisted, no pipes or redirects |
+| `git_status`, `git_diff`, `git_log`, `git_commit` | the usual |
+
+Reading is safe and never asks. Writing, editing, running and committing are
+`dangerous`, so with the shipped policy they are refused until you allow them:
+
+```bash
+toony config set tools.always_ask "write_code, edit_code, run_in_project"
+```
+
+## Vision
+
+```bash
+toony config set vision.provider auto        # the default
+ollama pull qwen2.5vl:7b                     # if your brain is a text-only model
+```
+
+`look_at_screen` and `read_screen_text` show the screen to a model that can
+actually see. That is usually the brain — but the default local brain is
+text-only, and a text-only model handed a screenshot does not say so, it invents
+a confident description of nothing. So `auto` checks whether the brain can read
+images and routes to `vision.model` when it cannot. `toony doctor` says which
+model will get the picture and whether it can see.
+
+## Wake word
+
+```bash
+toony wakeword "hey toony"
+toony wakeword --off
+```
+
+There are two engines and the command picks the right one for your phrase.
+
+**whisper** (the default for "hey Toony") transcribes short bursts of speech and
+matches the phrase fuzzily — "hey tunie", "hey tony" and "a tooney" all count,
+because that is what a two-word burst actually comes back as. Any phrase works
+with nothing to train. It needs `faster-whisper` and a little CPU; silence is
+never transcribed, so an idle desktop costs almost nothing.
+
+**openwakeword** is cheaper and sharper but only knows phrases somebody has
+trained a model for — `hey_jarvis`, `alexa`, `hey_mycroft`. Point
+`wakeword.model` at a `.onnx` file if you train your own.
+
+Too jumpy, or too deaf?
+
+```bash
+toony config set wakeword.similarity 0.8     # stricter
+toony config set wakeword.similarity 0.65    # looser
 ```
 
 ## Talking to it
@@ -54,9 +156,66 @@ sudo dnf install wireplumber playerctl spectacle wl-clipboard libnotify brightne
 | `toony say "hello"` | make it speak |
 | `toony status` | what it is doing right now |
 | `toony logs -f` | follow the log |
+| `toony gui` | open the window |
+| `Escape`, `Ctrl+.`, the ■ button | shut it up mid-sentence |
+| `toony cancel` | the same, from a terminal |
 
 `toony ask` works whether or not the daemon is running — without it, it builds a
-one-shot assistant in the foreground.
+one-shot assistant in the foreground. Either way it continues the conversation
+you were already having, so follow-up questions work.
+
+## The window
+
+```bash
+toony gui             # or click Toony in the launcher, or the tray icon
+```
+
+It lives in the system tray and stays there. Closing it hides it; the assistant
+carries on listening either way.
+
+|  |  |
+|---|---|
+| avatar | your GitHub picture, fetched once and cached, cropped to a circle |
+| `☰` | conversations — click one to carry on where it left off |
+| `＋` / `Ctrl+N` | start a fresh conversation |
+| `⚙` / `Ctrl+,` | every setting, grouped and typed |
+| 🎙 / `Ctrl+L` | push to talk — and the same button stops it mid-sentence |
+| `Escape` / `Ctrl+.` | stop talking now |
+| Allow / Deny | answer a permission question with a click instead of your voice |
+
+The window follows the daemon rather than driving it, so what you said into the
+microphone appears in it, and a permission question raised by a spoken request
+gets buttons.
+
+Set how see-through it is in settings, or from the terminal:
+
+```bash
+toony config set ui.opacity 0.85       # 0.35 to 1.0, applied live
+toony config set ui.theme dark         # auto follows Plasma
+toony config set ui.accent "#7c5cff"
+toony config set ui.always_on_top true
+toony config set ui.start_minimised false
+toony config set ui.avatar_url "https://example.com/me.png"
+```
+
+The window needs PySide6 — `./install.sh` includes it, or `pip install
+'toony[gui]'`, or `sudo dnf install python3-pyside6`.
+
+## Conversations
+
+Conversations are files under `~/.local/share/toony/conversations`, so they
+survive restarts and are the same threads the window's sidebar lists.
+
+```bash
+toony conversations             # list them, newest first
+toony new                       # start a fresh one
+toony ask --new "hello"         # ask in a fresh one
+toony reset                     # same as `new`
+```
+
+When Toony starts it carries on the last conversation if it is recent, and
+begins a new one if it is not — a two-day-old thread confuses a model more than
+it helps you. Change the cut-off with `conversation.resume_window_min`.
 
 ## Choosing a brain
 
@@ -137,9 +296,27 @@ Toony is recording or speaking, so it never triggers on its own voice.
 
 `toony tools` lists every tool, whether it is available, and how risky it is.
 
-Applications and windows, volume and brightness, media playback, the clipboard,
-screenshots and reading your screen, web search, file search, remembering facts,
-notifications, and — if you turn it on — a small allowlist of shell commands.
+Sixty-one tools, in eleven groups:
+
+| group | what it covers |
+|---|---|
+| applications | find and launch anything installed, list what is there |
+| windows | list, focus, close, switch virtual desktop |
+| system | volume, mute, brightness, battery, load, memory, disk, time |
+| **logs** | read the journal, and `diagnose_system` — one call that gathers failed services, errors since boot, memory and swap pressure, disk, crashes, OOM kills, temperature and kernel errors into a briefing |
+| **services** | list, inspect, start/stop/restart systemd units |
+| **network** | online state, Wi-Fi network and signal, scan, connect to a saved one, Bluetooth |
+| **power** | suspend, hibernate, reboot, shut down, log out, power profile, night colour |
+| **timers** | "remind me in ten minutes" — handed to systemd, so it survives a restart |
+| **packages** | is it installed, search the repos, count pending updates, install |
+| media & clipboard | play/pause/next, what is playing, read and write the clipboard, type text |
+| screen, files, web, memory | screenshots and reading your screen, file search, web search, remembered facts |
+
+Tools whose backing command is not installed are never offered to the model, so
+it cannot promise something your machine cannot do.
+
+Asking "what's going on with my system?" calls `diagnose_system` and answers
+from what it actually found.
 
 Tools whose backing command is not installed are never offered to the model, so
 it cannot promise something your machine cannot do.
@@ -153,9 +330,19 @@ passes through a gate keyed on how risky the tool is:
 |---|---|---|
 | `safe` | read the time, volume, battery, search the web | **allow** |
 | `sensitive` | launch an app, read the clipboard, screenshot, open a file | **ask** |
-| `dangerous` | close a window, type keystrokes, run a shell command | **deny** |
+| `dangerous` | close a window, type keystrokes, shut down, install a package | **deny** |
 
-"ask" means Toony asks you out loud and waits for a yes. Change any of them:
+"ask" means Toony asks — with buttons if the window is open, out loud if it is
+not. Individual tools can override their class, which is how "open Firefox" just
+opens Firefox instead of asking every time:
+
+```bash
+toony config set tools.always_allow "open_application, open_url, set_timer"
+toony config set tools.always_ask "write_clipboard"
+toony config set tools.never "type_text"          # refused whatever the class says
+```
+
+Change the classes themselves:
 
 ```bash
 toony config set tools.policy_sensitive allow
@@ -170,6 +357,49 @@ allowlist, with pipes, redirects and command substitution refused outright:
 toony config set tools.shell.enabled true
 toony config set tools.shell.allowlist "ls, df, free, uptime, systemctl status"
 ```
+
+### Administrator access
+
+Off by default. When you turn it on, Toony runs root commands only through
+`sudo -n` — which never prompts — and only ones whose prefix is on its own
+allowlist. Anything else is refused before sudo is even reached.
+
+```bash
+toony sudo status                        # what is allowed, and whether it works
+toony sudo enable                        # prints the sudoers snippet you need
+toony sudo allow "dmesg"                 # widen the list
+toony sudo forbid "dnf info"             # narrow it
+toony sudo disable
+```
+
+`toony sudo enable` will not silently work: it checks whether passwordless sudo
+is actually set up and shows you the `/etc/sudoers.d/toony` line to add if not.
+Because the daemon has no terminal, a command that would ask for a password
+fails immediately rather than hanging.
+
+## Not being talked at
+
+Two things stop a four-paragraph answer being read out in full.
+
+```bash
+toony config set general.reply_word_target 40    # ask for shorter answers
+toony config set tts.max_spoken_chars 500        # stop after this much, 0 for no cap
+```
+
+Past the cap it says "the rest is on screen" and stops. The window still shows
+everything. And whatever it is mid-way through, `Escape` ends it immediately.
+
+Written text is also rewritten before it is spoken, because a model writing for
+a screen produces things a synthesiser reads out letter by letter:
+
+| written | spoken |
+|---|---|
+| `/home/you/Projects/toony/app.py` | "app, the python file" |
+| `https://github.com/you/toony` | "github dot com, toony" |
+| a fenced code block | "I have put the code on screen" |
+| `**bold**`, bullets, emoji | gone |
+
+`toony config set tts.speakable false` turns it off.
 
 ## Configuration
 
@@ -203,15 +433,29 @@ Worth knowing:
 
 ```bash
 systemctl --user status toony        # or restart / stop
+toony shortcut --status              # why the hotkey does or does not work
 toony shortcut "Meta+Shift+Space"    # rebind push-to-talk
 toony install --no-start             # reinstall the unit without starting
-toony uninstall                      # remove the service and hotkey
+toony uninstall                      # remove the service, window and hotkey
 ```
 
 The hotkey works by running `toony listen`, which pokes the daemon over a unix
 socket in `$XDG_RUNTIME_DIR`. That indirection is deliberate: on Wayland an
 application cannot grab a global hotkey for itself, but the compositor can run a
 command. Any hotkey daemon works — it does not have to be KDE's.
+
+On KDE, three things must all line up, and `toony shortcut --status` checks each
+of them by name:
+
+1. `~/.local/share/applications/toony-listen.desktop` must carry
+   `X-KDE-GlobalAccel-CommandShortcut=true`. Without that line kglobalaccel
+   ignores the entry and the key does nothing at all.
+2. `~/.config/kglobalshortcutsrc` must bind `_launch` under
+   `[services][toony-listen.desktop]`, and kglobalaccel must be restarted to
+   notice, because it does not watch the file.
+3. Nothing else may already own the key. KDE gives a combination to whoever
+   grabbed it first, and on some layouts **Meta+Space is already taken by the
+   keyboard-layout switcher** — `--status` names whatever is holding it.
 
 ## Layout
 
@@ -223,12 +467,16 @@ toony/
 ├── config.py         defaults, TOML persistence, dotted access
 ├── ipc.py            the control socket
 ├── cli.py            every `toony` subcommand
+├── history.py        conversations on disk: save, list, reopen, prune
+├── text.py           making written text worth listening to
+├── ui/               the window: tray, chat, conversations, settings, avatar
 ├── audio/            devices, capture with endpointing, VAD, playback, wake word
 ├── brain/            claude · openai_compat (also Ollama) · prompts
 ├── stt/              local_whisper · cloud_whisper
 ├── tts/              piper · espeak · cloud · the sentence-streaming speaker
-└── tools/            applications, system, media, clipboard, files, screen,
-                      desktop, web, shell, memory — all on one registry
+└── tools/            applications, system, logs, power, network, packages,
+                      timers, code, media, clipboard, files, screen, desktop,
+                      web, shell, memory — all on one registry
 ```
 
 Audio is 16-bit PCM everywhere: it is what the VAD, the wake word model and
@@ -240,9 +488,11 @@ every speech backend take, so nothing converts on the hot path.
 python3 -m unittest discover -s tests -v
 ```
 
-The tests cover the agent loop, the permission gate, config typing, audio
-conversion and endpointing, sentence chunking, and the whole control socket —
-all with fakes, so they need no microphone, no GPU and no network.
+The tests cover the agent loop, the permission gate and its per-tool overrides,
+config typing, audio conversion and endpointing, sentence chunking, conversation
+storage, spoken-duration parsing, the sudo allowlist, shortcut matching, and the
+whole control socket including the event stream and click-to-confirm — all with
+fakes, so they need no microphone, no GPU and no network.
 
 ## Troubleshooting
 
@@ -254,8 +504,45 @@ cuts you off, raise `audio.silence_ms`. If it never stops, lower
 `tts.stream true`. Check where the time goes with `toony logs -f` — every stage
 logs its duration.
 
-**The hotkey does nothing.** Check `toony status` first. If the daemon is up,
-the binding did not take: System Settings → Shortcuts, look for "Toony: talk".
+**The hotkey does nothing.** `toony shortcut --status` — it checks the launcher
+entry, the binding, conflicts, kglobalacceld and the daemon, and names whichever
+one is wrong. The usual answer is that something else already owns Meta+Space;
+pick another with `toony shortcut "Meta+Alt+Space"`.
+
+**It says "I'm sorry, I can't assist with that."** That is a small local model
+declining a request it should have answered. Toony retries once with a nudge
+(`brain.retry_refusals`), but the real fix is a bigger model:
+`toony config set brain.ollama.model qwen2.5:7b`, or `toony use hybrid`.
+
+**It talks for a minute straight.** `Escape` stops it now. To stop it happening:
+`toony config set tts.max_spoken_chars 500` and
+`toony config set general.reply_word_target 40`.
+
+**It reads file paths out slash by slash.** That should not happen any more —
+check `tts.speakable` is still `true`.
+
+**It describes a screen it cannot see.** Your brain is a text-only model.
+`toony doctor` says so under `vision`; fix it with `ollama pull qwen2.5vl:7b`,
+or `toony use hybrid`.
+
+**"CUDAExecutionProvider is not in available provider names."** onnxruntime
+without CUDA, which openWakeWord asks for regardless. Harmless — the wake-word
+model is 80 milliseconds of audio at a time and runs fine on the CPU. Toony now
+silences it.
+
+**The wake word never fires.** `toony wakeword` shows the phrase and engine.
+openWakeWord only knows its own trained phrases, so if you asked for "hey toony"
+make sure the engine is `whisper`. Then lower `wakeword.similarity`.
+
+**It does not remember what I just said.** Check `toony status` shows a daemon
+and a conversation. `toony conversations` lists what has been saved.
+
+**The window will not open.** `toony gui` prints why. Almost always PySide6:
+`pip install 'toony[gui]'` or `sudo dnf install python3-pyside6`.
+
+**The tray icon is missing.** `toony install` writes the autostart entry; check
+`~/.config/autostart/toony-window.desktop` exists, and that the Plasma system
+tray is not hiding it under the "..." arrow.
 
 **Ollama is unreachable.** `systemctl --user status ollama`, and confirm
 `brain.ollama.base_url` ends in `/v1`.

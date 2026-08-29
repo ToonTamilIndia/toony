@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "toony"
-version = "0.1.0"
+version = "0.2.0"
 description = "Toony — a voice assistant for the Linux desktop"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,12 +29,13 @@ local = ["faster-whisper>=1.0"]    # local speech recognition
 wake = ["openwakeword>=0.6"]       # "hey Toony"
 vad = ["webrtcvad>=2.0.10"]        # sharper endpointing than the energy gate
 piper = ["piper-tts>=1.2"]         # local speech synthesis
-# The setup this project is built for: local ears and voice, cloud brain.
+gui = ["PySide6>=6.6"]             # the window and the tray icon
+# The setup this project is built for: local ears and voice, cloud brain, window.
 recommended = [
-    "toony[openai,local,piper]",
+    "toony[openai,local,piper,gui]",
 ]
 all = [
-    "toony[claude,openai,local,wake,vad,piper]",
+    "toony[claude,openai,local,wake,vad,piper,gui]",
 ]
 
 [project.scripts]

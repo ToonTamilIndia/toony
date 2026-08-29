@@ -3,11 +3,11 @@
 # Usage: ./install.sh [--extras "openai,local,piper"]
 set -euo pipefail
 
-EXTRAS="openai,local,piper"
+EXTRAS="openai,local,piper,gui"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --extras) EXTRAS="$2"; shift 2 ;;
-        --all)    EXTRAS="claude,openai,local,wake,vad,piper"; shift ;;
+        --all)    EXTRAS="claude,openai,local,wake,vad,piper,gui"; shift ;;
         -h|--help) sed -n '2,4p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
@@ -28,12 +28,15 @@ fi
 
 # Toony shells out to these. None are fatal; each one just enables a tool.
 suggest=()
-for cmd in wpctl playerctl spectacle wl-copy notify-send brightnessctl kdotool; do
+for cmd in wpctl playerctl spectacle wl-copy notify-send brightnessctl kdotool \
+           nmcli bluetoothctl kwriteconfig6 powerprofilesctl; do
     command -v "$cmd" >/dev/null || suggest+=("$cmd")
 done
 if [[ ${#suggest[@]} -gt 0 ]]; then
     echo "    optional commands not found: ${suggest[*]}"
-    echo "    on Fedora KDE:  sudo dnf install wireplumber playerctl spectacle wl-clipboard libnotify brightnessctl"
+    echo "    on Fedora KDE:  sudo dnf install wireplumber playerctl spectacle \\"
+    echo "                        wl-clipboard libnotify brightnessctl \\"
+    echo "                        NetworkManager-tui bluez power-profiles-daemon"
 fi
 
 echo "==> creating the virtualenv at $VENV"
@@ -55,11 +58,13 @@ echo "==> downloading a Piper voice"
 "$BIN/toony" voices install en_US-amy-medium || \
     echo "    (skipped — run 'toony voices install en_US-amy-medium' later)"
 
-echo "==> installing the user service and the push-to-talk hotkey"
+echo "==> installing the service, the window and the push-to-talk hotkey"
 "$BIN/toony" install
 
 echo
 echo "Done. Next:"
 echo "  toony doctor                     check what is missing"
+echo "  toony gui                        open the window"
 echo "  toony ask 'what time is it'      talk to it without the microphone"
 echo "  press Meta+Space                 push to talk"
+echo "  toony shortcut --status          if Meta+Space does nothing"

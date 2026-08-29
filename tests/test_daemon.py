@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import queue
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -15,6 +17,7 @@ from toony.agent import Agent
 from toony.app import Assistant
 from toony.brain.base import Brain, BrainReply, ToolCall
 from toony.config import Config
+from toony.history import Store
 
 
 class ScriptedBrain(Brain):
@@ -39,7 +42,7 @@ class FakeVoice:
         self.stopped = True
 
 
-def build_assistant(replies=None):
+def build_assistant(replies=None, store=None):
     """An Assistant with the audio and model stack replaced by fakes."""
     config = Config()
     assistant = Assistant.__new__(Assistant)
@@ -54,13 +57,16 @@ def build_assistant(replies=None):
     assistant.tts = type("T", (), {"name": "piper"})()
     assistant.voice = FakeVoice()
     assistant.player = type("P", (), {"chime": lambda self, kind="start": None})()
+    assistant.store = store or Store(Path(tempfile.mkdtemp()))
     assistant.agent = Agent(config, assistant.brain, speak=assistant.say,
-                            confirm=lambda question: False)
+                            confirm=lambda question: False,
+                            store=assistant.store, on_tool=assistant._on_tool)
     assistant._running = threading.Event()
     assistant._running.set()
     assistant._turn_requested = threading.Event()
     assistant._stop_listening = threading.Event()
     assistant._turn_lock = threading.Lock()
+    assistant._pending = {}
     assistant._server = ipc.ControlServer(assistant._handle)
     return assistant
 
@@ -82,7 +88,7 @@ class TestControlSocket(unittest.TestCase):
     def test_status_reports_the_configured_stack(self):
         reply = ipc.send("status", timeout=5)
         self.assertTrue(reply["ok"])
-        self.assertEqual(reply["brain"], "ollama:qwen3:4b")
+        self.assertEqual(reply["brain"], "ollama:qwen2.5:7b")
         self.assertFalse(reply["wakeword"])
 
     def test_ask_runs_the_tool_loop_and_speaks(self):
@@ -120,11 +126,130 @@ class TestControlSocket(unittest.TestCase):
         self.assertEqual(ipc.send("listen", edge="release", timeout=5)["action"],
                          "stopped listening")
 
-    def test_reset_clears_the_conversation(self):
+    def test_reset_starts_a_new_conversation(self):
         ipc.send("ask", text="hello", speak=False, timeout=30)
         self.assertTrue(self.assistant.agent.history)
+        before = self.assistant.agent.conversation.id
         self.assertTrue(ipc.send("reset", timeout=5)["ok"])
         self.assertEqual(self.assistant.agent.history, [])
+        self.assertNotEqual(self.assistant.agent.conversation.id, before)
+
+
+class TestConversations(unittest.TestCase):
+    def setUp(self):
+        self.assistant = build_assistant([BrainReply(text="Understood.")] * 6)
+        self.assistant._server.start()
+        self.addCleanup(self.assistant._server.stop)
+
+    def test_a_turn_is_saved_and_can_be_listed(self):
+        ipc.send("ask", text="remember the milk", speak=False, timeout=30)
+        rows = ipc.send("conversations", timeout=10)["conversations"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["title"], "remember the milk")
+        self.assertEqual(rows[0]["turns"], 1)
+
+    def test_an_old_conversation_can_be_reopened(self):
+        ipc.send("ask", text="first thread", speak=False, timeout=30)
+        first = ipc.send("status", timeout=5)["conversation"]
+        ipc.send("conversation", action="new", timeout=10)
+        ipc.send("ask", text="second thread", speak=False, timeout=30)
+        self.assertNotEqual(ipc.send("status", timeout=5)["conversation"], first)
+
+        reply = ipc.send("conversation", action="open", id=first, timeout=10)
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["id"], first)
+        self.assertEqual(reply["transcript"][0]["text"], "first thread")
+        # And the assistant is genuinely back in it, not just showing it.
+        self.assertEqual(ipc.send("status", timeout=5)["conversation"], first)
+
+    def test_deleting_a_conversation_removes_it(self):
+        ipc.send("ask", text="throwaway", speak=False, timeout=30)
+        target = ipc.send("status", timeout=5)["conversation"]
+        self.assertTrue(ipc.send("conversation", action="delete", id=target,
+                                 timeout=10)["ok"])
+        rows = ipc.send("conversations", timeout=10)["conversations"]
+        self.assertNotIn(target, [r["id"] for r in rows])
+
+    def test_asking_in_a_named_conversation_continues_it(self):
+        ipc.send("ask", text="one", speak=False, timeout=30)
+        target = ipc.send("status", timeout=5)["conversation"]
+        ipc.send("conversation", action="new", timeout=10)
+        ipc.send("ask", text="two", speak=False, conversation=target, timeout=30)
+        transcript = ipc.send("transcript", id=target, timeout=10)["transcript"]
+        self.assertEqual([t["text"] for t in transcript if t["role"] == "user"],
+                         ["one", "two"])
+
+    def test_unknown_conversation_is_an_error(self):
+        reply = ipc.send("conversation", action="open", id="nope", timeout=10)
+        self.assertFalse(reply["ok"])
+
+
+class TestEventStream(unittest.TestCase):
+    def setUp(self):
+        self.assistant = build_assistant([BrainReply(text="All done.")])
+        self.assistant._server.start()
+        self.addCleanup(self.assistant._server.stop)
+
+    def _collect(self, seconds=6.0):
+        """Subscribe on a background thread and gather what arrives."""
+        events: queue.Queue = queue.Queue()
+
+        def reader():
+            try:
+                for event in ipc.subscribe():
+                    events.put(event)
+            except OSError:
+                pass
+
+        thread = threading.Thread(target=reader, daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 2.0
+        while self.assistant._server.subscribers == 0 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return events
+
+    def test_a_turn_is_published_to_a_subscriber(self):
+        events = self._collect()
+        self.assertEqual(self.assistant._server.subscribers, 1)
+        ipc.send("ask", text="hello there", speak=False, timeout=30)
+
+        seen = {}
+        deadline = time.monotonic() + 6.0
+        while time.monotonic() < deadline and "reply" not in seen:
+            try:
+                event = events.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            seen.setdefault(str(event.get("event")), event)
+        self.assertEqual(seen["heard"]["text"], "hello there")
+        self.assertEqual(seen["reply"]["text"], "All done.")
+
+    def test_a_window_answers_the_permission_question(self):
+        """With a window attached, the yes/no comes from a click, not the mic."""
+        self._collect()
+        answers = queue.Queue()
+
+        def respond():
+            for event in ipc.subscribe():
+                if event.get("event") == "confirm":
+                    ipc.send("confirm", id=event["id"], allow=True, timeout=5)
+                    answers.put(event["question"])
+                    return
+
+        threading.Thread(target=respond, daemon=True).start()
+        deadline = time.monotonic() + 2.0
+        while self.assistant._server.subscribers < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        allowed = self.assistant._confirm("Can I open the door?")
+        self.assertTrue(allowed)
+        self.assertEqual(answers.get(timeout=2), "Can I open the door?")
+
+    def test_no_window_answer_falls_back_rather_than_hanging(self):
+        self._collect()
+        self.assistant.config.set("tools.confirm_timeout_s", 0.4, save=False)
+        # No responder, and no microphone either: it must return, not block.
+        self.assertFalse(self.assistant._confirm("Can I delete everything?"))
 
     def test_unknown_command_is_an_error_not_a_crash(self):
         reply = ipc.send("frobnicate", timeout=5)

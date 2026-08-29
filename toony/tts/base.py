@@ -40,8 +40,12 @@ def sentences(text: str):
     """Split into speakable chunks so playback can start before the model finishes.
 
     Yields whole sentences; anything longer than a breath is split on commas.
+
+    Nothing is rewritten here. Normalising a URL after splitting on full stops
+    is too late — the URL is already three fragments — so :func:`toony.text.
+    speakable` runs on each whole sentence, just before it is synthesised.
     """
-    text = clean_for_speech(text)
+    text = _presplit(text)
     buffer = ""
     for piece in re.split(r"(?<=[.!?])\s+", text):
         candidate = (buffer + " " + piece).strip() if buffer else piece
@@ -72,24 +76,22 @@ def _split_long(sentence: str, limit: int = 240):
         yield current
 
 
-_MARKDOWN = [
-    (re.compile(r"```.*?```", re.S), " code block "),
-    (re.compile(r"`([^`]*)`"), r"\1"),
-    (re.compile(r"\*\*([^*]*)\*\*"), r"\1"),
-    (re.compile(r"(?<!\w)[*_]([^*_]+)[*_](?!\w)"), r"\1"),
-    (re.compile(r"^\s*[-*+]\s+", re.M), ""),
-    (re.compile(r"^\s*#{1,6}\s*", re.M), ""),
-    (re.compile(r"\[([^\]]+)\]\([^)]+\)"), r"\1"),
-    (re.compile(r"https?://\S+"), " a link "),
-    (re.compile(r"[ \t]+"), " "),
-]
+# A code block must go before the text is split into sentences: its contents
+# are full of full stops, and each one would otherwise become its own utterance.
+_CODE_FENCE = re.compile(r"```.*?```", re.S)
+
+
+def _presplit(text: str) -> str:
+    """The one rewrite that has to happen before sentences are found."""
+    return _CODE_FENCE.sub(" I have put the code on screen. ", text).strip()
 
 
 def clean_for_speech(text: str) -> str:
-    """Strip anything a synthesiser would read out as punctuation soup."""
-    out = text.strip()
-    for pattern, replacement in _MARKDOWN:
-        out = pattern.sub(replacement, out)
-    # Emoji and symbols that have no spoken form.
-    out = re.sub(r"[\U0001F000-\U0001FAFF☀-➿]", "", out)
-    return out.strip()
+    """Strip anything a synthesiser would read out as punctuation soup.
+
+    Kept as the single entry point; the work lives in :mod:`toony.text`, which
+    also names file paths and links instead of spelling them out.
+    """
+    from ..text import speakable
+
+    return speakable(text)

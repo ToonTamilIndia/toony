@@ -19,6 +19,13 @@ DEFAULTS: dict[str, Any] = {
         "name": "Toony",
         "language": "en",
         "log_level": "info",
+        # plain | friendly | spicy | custom — how it talks to you.
+        "personality": "friendly",
+        # Only used when personality = custom.
+        "personality_prompt": "",
+        # What it is for. Adds the matching guidance to the system prompt.
+        # general | coding
+        "focus": "general",
         # Spoken replies are capped so the assistant stays conversational.
         "reply_word_target": 60,
     },
@@ -28,6 +35,9 @@ DEFAULTS: dict[str, Any] = {
         "temperature": 0.5,
         "max_history_turns": 20,
         "max_tool_iterations": 6,
+        # Small local models sometimes decline a perfectly ordinary request.
+        # Retry once with a nudge before believing them.
+        "retry_refusals": True,
         "system_prompt": "",  # empty -> built-in prompt from brain/prompts.py
     },
     "brain.claude": {
@@ -51,10 +61,18 @@ DEFAULTS: dict[str, Any] = {
     },
     "brain.ollama": {
         "base_url": "http://localhost:11434/v1",
-        "model": "qwen3:4b",
+        "model": "qwen2.5:7b",
         "api_key": "ollama",                # Ollama ignores it, the client needs one
         "api_key_env": "",
         "max_tokens": 2048,
+    },
+    "vision": {
+        # Looking at the screen. The brain is used when it can read images;
+        # otherwise the model named here is, and only for looking.
+        "enabled": True,
+        "provider": "auto",      # auto | brain | claude | openai | ollama
+        "model": "",             # "" = that provider's default vision model
+        "max_tokens": 700,
     },
     "stt": {
         # local | openai
@@ -79,6 +97,12 @@ DEFAULTS: dict[str, Any] = {
         "speed": 1.0,
         # Speak the reply while it is still being generated.
         "stream": True,
+        # Rewrite paths, URLs, markdown and code before speaking them, so a
+        # file path is named rather than read out slash by slash.
+        "speakable": True,
+        # Stop speaking after this many characters and say the rest is on
+        # screen. 0 removes the cap.
+        "max_spoken_chars": 700,
     },
     "tts.piper": {
         "voice": "en_US-amy-medium",
@@ -112,10 +136,17 @@ DEFAULTS: dict[str, Any] = {
     },
     "wakeword": {
         "enabled": False,
-        "engine": "openwakeword",
-        "model": "hey_jarvis",              # or a path to a custom "hey toony" model
+        # openwakeword is cheap but only knows phrases somebody trained a model
+        # for. whisper matches any phrase, including "hey Toony", at the cost of
+        # some CPU. Set both with: toony wakeword "hey toony"
+        "engine": "whisper",
+        "phrase": "hey toony",              # whisper engine
+        "similarity": 0.72,                 # whisper engine, 0.5 loose - 0.9 strict
+        "whisper_model": "tiny.en",         # whisper engine
+        "max_burst_s": 2.5,                 # whisper engine
+        "model": "hey_jarvis",              # openwakeword: bundled name or a path
         "model_dir": str(WAKEWORD_DIR),
-        "threshold": 0.5,
+        "threshold": 0.5,                   # openwakeword
         "cooldown_s": 2.0,
     },
     "ptt": {
@@ -131,11 +162,47 @@ DEFAULTS: dict[str, Any] = {
         "policy_sensitive": "ask",
         "policy_dangerous": "deny",
         "confirm_timeout_s": 20,
+        # Per-tool overrides, checked before the risk tiers above. Launching an
+        # app is the classic case: "sensitive" by class, but you never want to
+        # be asked twice about opening Firefox.
+        "always_allow": ["open_application", "open_url", "search_in_browser",
+                         "open_file", "read_clipboard", "write_clipboard",
+                         "focus_window", "lock_screen", "read_system_logs",
+                         "diagnose_system", "list_services", "network_status",
+                         "set_timer", "list_timers", "cancel_timer"],
+        "always_ask": [],
+        "never": [],
+    },
+    "tools.sudo": {
+        # Off by default. Turn it on with: toony sudo enable
+        "enabled": False,
+        # Only these commands may ever run as root, matched on the whole
+        # command prefix. Nothing outside this list is attempted.
+        "allowlist": [
+            "dnf check-update", "dnf list updates", "dnf info", "dnf search",
+            "journalctl", "systemctl status", "systemctl restart",
+            "dmesg", "smartctl -H", "fwupdmgr get-updates",
+        ],
+        # Only passwordless sudo is used, so Toony can never sit on a
+        # password prompt. Set that up with: toony sudo enable
+        "timeout_s": 60,
+    },
+    "tools.logs": {
+        "max_lines": 60,
+        "default_window": "1 hour ago",
     },
     "tools.shell": {
         "enabled": False,
         "allowlist": ["ls", "cat", "df", "free", "uptime", "systemctl status"],
         "timeout_s": 15,
+    },
+    "tools.code": {
+        # Everything the code tools touch must live under here.
+        "root": "~/Projects",
+        "max_read_bytes": 60000,
+        "timeout_s": 180,
+        # Commands run_in_project may run. Empty uses the built-in list.
+        "commands": [],
     },
     "tools.web": {
         "engine": "duckduckgo",
@@ -145,6 +212,30 @@ DEFAULTS: dict[str, Any] = {
     "memory": {
         "enabled": True,
         "max_facts": 200,
+    },
+    "conversation": {
+        # Conversations survive restarts and are listed in the GUI.
+        "persist": True,
+        "max_stored": 100,
+        # Start a fresh conversation if the last one has been idle this long.
+        "resume_window_min": 120,
+    },
+    "ui": {
+        "enabled": True,
+        # 0.35 to 1.0. Applies to the floating window, not the tray menu.
+        "opacity": 0.97,
+        "theme": "auto",                    # auto | dark | light
+        "accent": "#7c5cff",
+        "font_size": 14,
+        "width": 460,
+        "height": 640,
+        "start_minimised": True,            # live in the tray until called
+        "tray": True,
+        "always_on_top": False,
+        "avatar_url": "https://avatars.githubusercontent.com/u/121746774?v=4",
+        "autostart": True,
+        # Show the window whenever a voice turn begins.
+        "pop_on_listen": True,
     },
 }
 

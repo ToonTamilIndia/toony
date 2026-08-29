@@ -1,12 +1,19 @@
-"""Wake-word listening ("hey Toony") with openWakeWord.
+"""Wake-word listening, with two engines behind one microphone loop.
 
-Runs its own microphone stream in a background thread and calls back when the
-phrase is heard. The stream is released while Toony is recording or speaking, so
-the assistant never hears itself.
+openWakeWord is accurate and nearly free to run, but it only knows the phrases
+somebody has trained a model for — and "hey Toony" is not one of them. So there
+is a second engine that runs a tiny Whisper over short bursts of speech and
+matches the phrase you actually want. It costs more CPU and fires a little less
+reliably, but it works today, for any phrase, with nothing to train.
+
+Either way the stream is released while Toony is recording or speaking, so the
+assistant never hears itself.
 """
 
 from __future__ import annotations
 
+import difflib
+import re
 import threading
 import time
 from pathlib import Path
@@ -16,59 +23,285 @@ from ..log import get
 
 log = get("audio.wakeword")
 
-CHUNK = 1280  # openWakeWord expects 80 ms of 16 kHz audio per call
+CHUNK = 1280            # openWakeWord expects 80 ms of 16 kHz audio per call
+RATE = 16000
+
+_BUNDLED = {"hey_jarvis", "alexa", "hey_mycroft", "hey_rhasspy", "timer",
+            "weather"}
 
 
+def suggest_engine(phrase: str) -> str:
+    """Which engine can actually hear this phrase."""
+    slug = re.sub(r"[^a-z0-9]+", "_", phrase.lower()).strip("_")
+    return "openwakeword" if slug in _BUNDLED else "whisper"
+
+
+# ---------------------------------------------------------------- detectors
+class Detector:
+    """Fed 80 ms of PCM at a time; returns a phrase name when it hears one."""
+
+    name = "detector"
+
+    def feed(self, pcm: bytes) -> str | None:
+        raise NotImplementedError
+
+    def reset(self) -> None:
+        pass
+
+    def check(self) -> str:
+        return "ready"
+
+
+class OpenWakeWordDetector(Detector):
+    name = "openwakeword"
+
+    def __init__(self, config):
+        self.threshold = float(config.get("wakeword.threshold", 0.5))
+        self.model = self._load(config)
+
+    def _load(self, config):
+        # openWakeWord asks onnxruntime for CUDA whether or not it is there and
+        # prints a warning when it is not. It runs fine on the CPU — this is an
+        # 80 ms model — so the noise is not worth alarming anybody with.
+        import warnings
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*CUDAExecutionProvider.*")
+            try:
+                from openwakeword.model import Model
+            except ImportError as exc:
+                raise RuntimeError("Wake word needs openwakeword: "
+                                   "pip install 'toony[wake]'") from exc
+
+            name = str(config.get("wakeword.model", "hey_jarvis"))
+            directory = Path(str(config.get("wakeword.model_dir", ""))).expanduser()
+            custom = directory / f"{name}.onnx"
+            try:
+                if custom.is_file():
+                    log.info("loading custom wake word model %s", custom)
+                    return Model(wakeword_model_paths=[str(custom)])
+                if Path(name).is_file():
+                    return Model(wakeword_model_paths=[name])
+                if name not in _BUNDLED:
+                    raise RuntimeError(
+                        f"openWakeWord has no model called {name!r}. Either train "
+                        f"one, or switch to the whisper engine, which matches any "
+                        f"phrase: toony wakeword \"hey toony\"")
+                import openwakeword
+                bundled = (Path(openwakeword.__file__).parent
+                           / "resources" / "models" / f"{name}.onnx")
+                if not bundled.is_file():
+                    matches = sorted(
+                        (Path(openwakeword.__file__).parent
+                         / "resources" / "models").glob(f"{name}*.onnx"))
+                    if matches:
+                        bundled = matches[0]
+                    else:
+                        raise RuntimeError(
+                            f"no bundled model file found for {name!r}")
+                log.info("loading bundled wake word model %s", bundled.name)
+                return Model(wakeword_model_paths=[str(bundled)])
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    f"could not load wake word model {name!r}: {exc}") from exc
+
+    def feed(self, pcm: bytes) -> str | None:
+        import numpy as np
+
+        scores = self.model.predict(np.frombuffer(pcm, dtype="<i2"))
+        for name, score in scores.items():
+            if score >= self.threshold:
+                log.debug("wake score %s %.2f", name, score)
+                return name
+        return None
+
+    def reset(self) -> None:
+        self.model.reset()
+
+
+class WhisperDetector(Detector):
+    """Transcribe short bursts of speech and look for the phrase in them.
+
+    Only speech is transcribed, never silence, so on an idle desktop this does
+    almost nothing. A burst is closed by silence or by getting too long, which
+    keeps each transcription to well under a second of audio.
+    """
+
+    name = "whisper"
+
+    def __init__(self, config):
+        self.phrase = str(config.get("wakeword.phrase", "hey toony")).lower().strip()
+        self.similarity = float(config.get("wakeword.similarity", 0.72))
+        self.threshold = float(config.get("audio.energy_threshold", 0.012))
+        self.max_burst = float(config.get("wakeword.max_burst_s", 2.5))
+        self.silence_chunks = 4          # ~320 ms of quiet ends a burst
+        self._buffer = bytearray()
+        self._quiet = 0
+        self._speaking = False
+        self._model = None
+        self._config = config
+        self._words = [w for w in re.split(r"\W+", self.phrase) if w]
+
+    def _load(self):
+        if self._model is not None:
+            return self._model
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as exc:
+            raise RuntimeError("The whisper wake word needs faster-whisper: "
+                               "pip install 'toony[local]'") from exc
+        size = str(self._config.get("wakeword.whisper_model", "tiny.en"))
+        device = str(self._config.get("stt.local.device", "auto"))
+        if device == "auto":
+            device = "cpu"      # the wake word must not fight the real STT for VRAM
+        log.info("loading %s for wake-word spotting on %s", size, device)
+        self._model = WhisperModel(size, device=device,
+                                   compute_type="int8" if device == "cpu" else "float16")
+        return self._model
+
+    def check(self) -> str:
+        try:
+            self._load()
+        except RuntimeError as exc:
+            return str(exc)
+        return f"listening for {self.phrase!r}"
+
+    def feed(self, pcm: bytes) -> str | None:
+        loud = _rms(pcm) >= self.threshold
+        if loud:
+            self._speaking = True
+            self._quiet = 0
+        elif self._speaking:
+            self._quiet += 1
+
+        if self._speaking:
+            self._buffer += pcm
+
+        too_long = len(self._buffer) > self.max_burst * RATE * 2
+        ended = self._speaking and (self._quiet >= self.silence_chunks or too_long)
+        if not ended:
+            return None
+
+        burst, self._buffer = bytes(self._buffer), bytearray()
+        self._speaking, self._quiet = False, 0
+        if len(burst) < 0.25 * RATE * 2:        # too short to be a phrase
+            return None
+        return self.phrase if self._matches(burst) else None
+
+    def _matches(self, pcm: bytes) -> bool:
+        import numpy as np
+
+        audio = np.frombuffer(pcm, dtype="<i2").astype("float32") / 32768.0
+        try:
+            segments, _ = self._load().transcribe(
+                audio, language="en", beam_size=1, without_timestamps=True,
+                initial_prompt=self.phrase, vad_filter=False)
+            heard = " ".join(segment.text for segment in segments)
+        except Exception as exc:
+            log.warning("wake-word transcription failed: %s", exc)
+            return False
+        return phrase_heard(heard, self.phrase, self.similarity)
+
+    def reset(self) -> None:
+        self._buffer.clear()
+        self._speaking, self._quiet = False, 0
+
+
+def _skeleton(word: str) -> str:
+    """The consonants, collapsed. Whisper mangles vowels far more than these.
+
+    "toony", "tunie", "toonie" and "tooney" all reduce to "tny"; "there" and
+    "junie" do not, which is exactly the distinction that matters.
+    """
+    out = []
+    for letter in word.lower():
+        if letter in "aeiouy" or not letter.isalpha():
+            continue
+        if not out or out[-1] != letter:
+            out.append(letter)
+    return "".join(out) or word.lower()[:1]
+
+
+def _similar(heard: str, target: str) -> float:
+    return max(difflib.SequenceMatcher(None, heard, target).ratio(),
+               difflib.SequenceMatcher(None, _skeleton(heard),
+                                       _skeleton(target)).ratio())
+
+
+def phrase_heard(heard: str, phrase: str, similarity: float = 0.72) -> bool:
+    """Did this transcript contain the wake phrase?
+
+    Speech recognition on a two-word burst is unreliable in predictable ways —
+    "hey Toony" comes back as "hey tunie", "hey tony", "a tooney" — so what is
+    compared is the name itself, both as written and as consonants, with the
+    "hey" in front used only as corroboration for a weaker match.
+    """
+    words = re.sub(r"[^a-z0-9 ]+", " ", heard.lower()).split()
+    target = phrase.lower().split()
+    if not words or not target:
+        return False
+
+    name = target[-1]
+    prefix = target[-2] if len(target) > 1 else ""
+    for index, word in enumerate(words):
+        score = _similar(word, name)
+        if score >= 0.85:
+            return True                 # unmistakable on its own
+        if score < similarity:
+            continue
+        if not prefix:
+            return True
+        # The prefix is checked strictly, on the raw spelling only. It is a
+        # short function word, so a loose match lets "the tuning" through as
+        # "hey Toony"; a clearly-heard name does not need it anyway.
+        before = words[index - 1] if index else ""
+        if before and difflib.SequenceMatcher(None, before, prefix).ratio() >= 0.75:
+            return True
+    return False
+
+
+def _rms(pcm: bytes) -> float:
+    import numpy as np
+
+    if not pcm:
+        return 0.0
+    samples = np.frombuffer(pcm, dtype="<i2").astype("float32") / 32768.0
+    return float(np.sqrt(np.mean(samples * samples))) if samples.size else 0.0
+
+
+def build_detector(config) -> Detector:
+    engine = str(config.get("wakeword.engine", "openwakeword")).lower()
+    if engine in ("whisper", "faster-whisper", "local"):
+        return WhisperDetector(config)
+    if engine == "openwakeword":
+        return OpenWakeWordDetector(config)
+    raise RuntimeError(f"Unknown wake word engine {engine!r}. "
+                       "Choose openwakeword or whisper.")
+
+
+# ------------------------------------------------------------------ listener
 class WakeWordListener:
     def __init__(self, config, on_wake: Callable[[str], None]):
         self.config = config
         self.on_wake = on_wake
-        self.threshold = float(config.get("wakeword.threshold", 0.5))
         self.cooldown = float(config.get("wakeword.cooldown_s", 2.0))
-        self._model = None
+        self._detector: Detector | None = None
         self._thread: threading.Thread | None = None
         self._running = threading.Event()
         self._paused = threading.Event()
         self._last_fire = 0.0
 
-    # ---- model ------------------------------------------------------------
-    def _load(self):
-        if self._model is not None:
-            return self._model
-        try:
-            from openwakeword.model import Model
-        except ImportError as exc:
-            raise RuntimeError(
-                "Wake word needs openwakeword: pip install 'toony[wake]'") from exc
+    def _load(self) -> Detector:
+        if self._detector is None:
+            self._detector = build_detector(self.config)
+        return self._detector
 
-        name = str(self.config.get("wakeword.model", "hey_jarvis"))
-        directory = Path(str(self.config.get("wakeword.model_dir", ""))).expanduser()
-        custom = directory / f"{name}.onnx"
-        try:
-            if custom.is_file():
-                log.info("loading custom wake word model %s", custom)
-                self._model = Model(wakeword_model_paths=[str(custom)])
-            elif Path(name).is_file():
-                self._model = Model(wakeword_model_paths=[name])
-            else:
-                import openwakeword
-                bundled = (Path(openwakeword.__file__).parent
-                           / "resources" / "models" / f"{name}.onnx")
-                if bundled.is_file():
-                    log.info("loading bundled wake word model %r", name)
-                    self._model = Model(wakeword_model_paths=[str(bundled)])
-                else:
-                    matches = sorted(
-                        (Path(openwakeword.__file__).parent
-                         / "resources" / "models").glob(f"{name}*.onnx"))
-                    if matches:
-                        log.info("loading bundled wake word model %s", matches[0].name)
-                        self._model = Model(wakeword_model_paths=[str(matches[0])])
-                    else:
-                        raise RuntimeError(f"no wake word model found for {name!r}")
-        except Exception as exc:
-            raise RuntimeError(f"could not load wake word model {name!r}: {exc}") from exc
-        return self._model
+    @property
+    def engine(self) -> str:
+        return self._detector.name if self._detector else str(
+            self.config.get("wakeword.engine", "openwakeword"))
 
     # ---- lifecycle --------------------------------------------------------
     def start(self) -> None:
@@ -79,7 +312,7 @@ class WakeWordListener:
         self._thread = threading.Thread(target=self._loop, name="toony-wake",
                                         daemon=True)
         self._thread.start()
-        log.info("listening for the wake word")
+        log.info("listening for the wake word (%s)", self.engine)
 
     def stop(self) -> None:
         self._running.clear()
@@ -92,8 +325,8 @@ class WakeWordListener:
         self._paused.set()
 
     def resume(self) -> None:
-        if self._model is not None:
-            self._model.reset()
+        if self._detector is not None:
+            self._detector.reset()
         self._paused.clear()
 
     @property
@@ -102,40 +335,37 @@ class WakeWordListener:
 
     # ---- the listening loop ----------------------------------------------
     def _loop(self) -> None:
-        import numpy as np
         import sounddevice as sd
 
         from .devices import resolve
 
         device = resolve(self.config.get("audio.input_device", ""), want_input=True)
-        model = self._load()
+        detector = self._load()
         while self._running.is_set():
             if self._paused.is_set():
                 time.sleep(0.1)
                 continue
             try:
-                with sd.RawInputStream(samplerate=16000, blocksize=CHUNK,
+                with sd.RawInputStream(samplerate=RATE, blocksize=CHUNK,
                                        device=device, channels=1,
                                        dtype="int16") as stream:
                     while self._running.is_set() and not self._paused.is_set():
                         data, overflowed = stream.read(CHUNK)
                         if overflowed:
                             continue
-                        audio = np.frombuffer(bytes(data), dtype="<i2")
-                        scores = model.predict(audio)
-                        for name, score in scores.items():
-                            if score >= self.threshold:
-                                self._fire(name, float(score))
+                        heard = detector.feed(bytes(data))
+                        if heard:
+                            self._fire(heard)
             except Exception as exc:
                 log.error("wake word stream failed: %s — retrying in 3s", exc)
                 time.sleep(3)
 
-    def _fire(self, name: str, score: float) -> None:
+    def _fire(self, name: str) -> None:
         now = time.monotonic()
         if now - self._last_fire < self.cooldown:
             return
         self._last_fire = now
-        log.info("wake word %r heard (%.2f)", name, score)
+        log.info("wake word %r heard", name)
         self.pause()
         try:
             self.on_wake(name)

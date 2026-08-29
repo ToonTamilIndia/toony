@@ -25,6 +25,26 @@ def policy_for(config, risk: str) -> Decision:
     return value if value in ("allow", "ask", "deny") else "ask"
 
 
+def decision_for(config, tool: Tool) -> Decision:
+    """What to do with this specific tool.
+
+    Per-tool lists win over the risk tiers, in order of severity: a name in
+    ``tools.never`` is refused even if its class is allowed, and a name in
+    ``tools.always_allow`` skips the question even though its class asks.
+    Launching an application is the case that motivated this — it is sensitive
+    as a class, but nobody wants to confirm opening Firefox every time.
+    """
+    if not config:
+        return "ask"
+    if tool.name in set(config.get("tools.never", []) or []):
+        return "deny"
+    if tool.name in set(config.get("tools.always_ask", []) or []):
+        return "ask"
+    if tool.name in set(config.get("tools.always_allow", []) or []):
+        return "allow"
+    return policy_for(config, tool.risk)
+
+
 def describe(tool: Tool, arguments: dict) -> str:
     """A short spoken sentence asking permission."""
     if arguments:
@@ -49,7 +69,7 @@ class Denied(Exception):
 def authorise(tool: Tool, arguments: dict, ctx: ToolContext) -> None:
     """Raise :class:`Denied` unless this call is permitted."""
     config = ctx.config
-    decision = policy_for(config, tool.risk) if config else "ask"
+    decision = decision_for(config, tool)
 
     if decision == "allow":
         return

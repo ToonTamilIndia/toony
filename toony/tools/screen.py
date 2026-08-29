@@ -67,17 +67,46 @@ def take_screenshot(ctx: ToolContext, region: bool = False) -> str:
                            "description": "What to determine from the screen."}},
       required=["question"])
 def look_at_screen(ctx: ToolContext, question: str) -> str:
-    if ctx.brain is None:
-        return "I have no vision model configured right now."
+    """Show the screen to a model that can actually see.
+
+    Not necessarily the brain: the default local model is text-only, and handed
+    an image it invents a plausible description rather than admitting it saw
+    nothing, so the vision model is resolved separately.
+    """
+    from ..brain import build_vision
     from ..brain.base import BrainError, Message
+
+    try:
+        eyes = ctx.state.get("vision") or build_vision(ctx.config)
+        ctx.state["vision"] = eyes      # loading it once is enough
+    except BrainError as exc:
+        return (f"I cannot look at the screen: {exc} "
+                "Set one up with: toony config set vision.model qwen2.5vl:7b")
+    except Exception as exc:
+        return f"I cannot look at the screen: {exc}"
 
     path = capture()
     data = base64.standard_b64encode(path.read_bytes()).decode("ascii")
     prompt = ("You are looking at a screenshot of the user's Linux desktop. "
-              "Answer this in two sentences at most, as spoken text: " + question)
+              "Answer in two sentences at most, as text that will be read "
+              "aloud. Describe only what you can actually see; if the image is "
+              "unreadable, say so.")
     try:
-        reply = ctx.brain.reply(prompt, [Message.user_image(question, data)], [])
+        reply = eyes.reply(prompt, [Message.user_image(question, data)], [])
     except BrainError as exc:
         return (f"I could not read the screen: {exc} "
-                "The configured model may not accept images.")
+                "The vision model may not accept images — check: toony doctor")
     return reply.text or "I could not make out anything useful on the screen."
+
+
+@tool(description="Read the text on the user's screen, for example an error "
+                  "message, a stack trace or a snippet of code they are "
+                  "pointing at. Use this before answering a question about "
+                  "something they can see but have not typed out.",
+      risk="sensitive",
+      params={"region": {"type": "boolean", "default": False,
+                         "description": "Ask the user to drag a region first."}})
+def read_screen_text(ctx: ToolContext, region: bool = False) -> str:
+    return look_at_screen(
+        ctx, "Transcribe every piece of text visible on this screen, exactly as "
+             "written, keeping code and error messages verbatim. No commentary.")

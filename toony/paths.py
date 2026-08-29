@@ -25,6 +25,14 @@ LOG_FILE = STATE_DIR / "toony.log"
 PIPER_DIR = DATA_DIR / "piper"
 WAKEWORD_DIR = DATA_DIR / "wakeword"
 SCREENSHOT_DIR = CACHE_DIR / "screenshots"
+# One JSON file per conversation, so a corrupt one cannot take the rest with it.
+CONVERSATION_DIR = DATA_DIR / "conversations"
+AVATAR_FILE = CACHE_DIR / "avatar.png"
+
+APPLICATIONS_DIR = _xdg("XDG_DATA_HOME", "~/.local/share") / "applications"
+AUTOSTART_DIR = _xdg("XDG_CONFIG_HOME", "~/.config") / "autostart"
+ICON_DIR = (_xdg("XDG_DATA_HOME", "~/.local/share")
+            / "icons" / "hicolor" / "256x256" / "apps")
 
 
 def runtime_dir() -> Path:
@@ -41,5 +49,5 @@ def socket_path() -> Path:
 
 def ensure_dirs() -> None:
     for d in (CONFIG_DIR, DATA_DIR, CACHE_DIR, STATE_DIR, PIPER_DIR,
-              WAKEWORD_DIR, SCREENSHOT_DIR, runtime_dir()):
+              WAKEWORD_DIR, SCREENSHOT_DIR, CONVERSATION_DIR, runtime_dir()):
         d.mkdir(parents=True, exist_ok=True)

@@ -6,8 +6,10 @@ serially. States: idle -> listening -> thinking -> speaking -> idle.
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
+import uuid
 
 from .agent import Agent
 from .audio.capture import AudioUnavailable, Microphone
@@ -15,6 +17,7 @@ from .audio.playback import Player
 from .brain import build_brain
 from .brain.base import BrainError
 from .config import Config
+from .history import store_for
 from .ipc import ControlServer
 from .log import get
 from .stt import STTError, build_stt
@@ -32,7 +35,7 @@ _NO = {"no", "nope", "don't", "dont", "stop", "cancel", "never", "nevermind",
 class Assistant:
     def __init__(self, config: Config):
         self.config = config
-        self.state = "starting"
+        self._state = "starting"
         self.started_at = time.monotonic()
         self.last_error = ""
         self.turns = 0
@@ -41,9 +44,12 @@ class Assistant:
         self.brain = build_brain(config)
         self.stt = build_stt(config)
         self.tts = build_tts(config)
-        self.voice = Speaker(self.tts, self.player,
-                             stream=bool(config.get("tts.stream", True)))
-        self.agent = Agent(config, self.brain, speak=self.say, confirm=self._confirm)
+        self.voice = Speaker.from_config(self.tts, self.player, config)
+        self.store = store_for(config)
+        self.agent = Agent(config, self.brain, speak=self.say,
+                           confirm=self._confirm, store=self.store,
+                           on_tool=self._on_tool)
+        self.agent.resume()
 
         self.wakeword = self._build_wakeword(config)
 
@@ -53,6 +59,35 @@ class Assistant:
         self._stop_listening = threading.Event()
         self._turn_lock = threading.Lock()
         self._audio_thread: threading.Thread | None = None
+        # Permission questions waiting on an answer from the GUI.
+        self._pending: dict[str, queue.Queue] = {}
+
+    # ---- state, published as it changes ----------------------------------
+    @property
+    def state(self) -> str:
+        return self._state
+
+    @state.setter
+    def state(self, value: str) -> None:
+        changed = value != getattr(self, "_state", None)
+        self._state = value
+        if changed:
+            self.publish("state", state=value)
+
+    def publish(self, event: str, **data) -> None:
+        """Tell every subscriber (the GUI) what just happened."""
+        server = getattr(self, "_server", None)
+        if server is None:
+            return
+        try:
+            server.broadcast({"event": event, "at": time.time(), **data})
+        except Exception:
+            log.debug("could not publish %s", event, exc_info=True)
+
+    def _on_tool(self, name: str, arguments: dict, output: str,
+                 is_error: bool) -> None:
+        self.publish("tool", tool=name, arguments=arguments,
+                     result=output[:400], error=is_error)
 
     # ---- lifecycle --------------------------------------------------------
     def start(self) -> None:
@@ -107,6 +142,7 @@ class Assistant:
 
     def stop(self) -> None:
         self._running.clear()
+        self.agent.persist()   # never lose the last thing that was said
         self.voice.stop()
         if self.wakeword is not None:
             self.wakeword.stop()
@@ -166,6 +202,9 @@ class Assistant:
 
             log.info("heard: %s", transcript.text)
             self.turns += 1
+            self.publish("heard", text=transcript.text,
+                         confidence=getattr(transcript, "confidence", None),
+                         conversation=self.agent.conversation.id)
             self._answer(transcript.text)
         finally:
             self.state = "idle"
@@ -191,11 +230,15 @@ class Assistant:
 
     def _run_agent(self, text: str, on_text=None) -> str:
         try:
-            return self.agent.ask(text, on_text=on_text)
+            reply = self.agent.ask(text, on_text=on_text)
         except BrainError as exc:
             self.last_error = str(exc)
             log.error("brain failed: %s", exc)
-            return str(exc)
+            reply = str(exc)
+        self.publish("reply", text=reply,
+                     conversation=self.agent.conversation.id,
+                     title=self.agent.conversation.display_title())
+        return reply
 
     def say(self, text: str) -> None:
         """Speak a message. Blocks until it is finished or interrupted."""
@@ -212,6 +255,36 @@ class Assistant:
 
     # ---- confirmation for "ask" policies ---------------------------------
     def _confirm(self, question: str) -> bool:
+        """Get a yes or a no — from the GUI if it is open, otherwise by voice.
+
+        A window with Allow and Deny buttons is a far better place to answer a
+        permission question than a microphone, so it wins whenever one is
+        attached. Voice remains the fallback for a headless session.
+        """
+        if self._server is not None and self._server.subscribers:
+            answered = self._confirm_in_ui(question)
+            if answered is not None:
+                return answered
+        return self._confirm_by_voice(question)
+
+    def _confirm_in_ui(self, question: str) -> bool | None:
+        """Returns True/False, or None if no window answered in time."""
+        request_id = uuid.uuid4().hex[:8]
+        inbox: queue.Queue = queue.Queue(maxsize=1)
+        self._pending[request_id] = inbox
+        timeout = float(self.config.get("tools.confirm_timeout_s", 20))
+        try:
+            self.publish("confirm", id=request_id, question=question,
+                         timeout=timeout)
+            try:
+                return bool(inbox.get(timeout=timeout))
+            except queue.Empty:
+                log.info("no window answered the permission question")
+                return None
+        finally:
+            self._pending.pop(request_id, None)
+
+    def _confirm_by_voice(self, question: str) -> bool:
         """Ask out loud, then listen for a yes or a no."""
         self.say(question)
         try:
@@ -250,6 +323,11 @@ class Assistant:
                 "stt": self.stt.name, "tts": self.tts.name,
                 "wakeword": bool(self.wakeword and self.wakeword.active),
                 "history_messages": len(self.agent.history),
+                "conversation": self.agent.conversation.id,
+                "conversation_title": self.agent.conversation.display_title(),
+                "windows": self._server.subscribers if self._server else 0,
+                "sudo": bool(self.config.get("tools.sudo.enabled", False)),
+                "tools": len(self.agent.tools()),
                 "last_error": self.last_error}
 
     def _cmd_listen(self, request: dict) -> dict:
@@ -267,6 +345,7 @@ class Assistant:
             self._stop_listening.set()
             return {"ok": True, "action": "stopped listening"}
         self._turn_requested.set()
+        self.publish("listen_requested")
         return {"ok": True, "action": "listening"}
 
     def _cmd_cancel(self, request: dict) -> dict:
@@ -280,8 +359,18 @@ class Assistant:
         text = str(request.get("text", "")).strip()
         if not text:
             return {"ok": False, "error": "no text given"}
+        wanted = str(request.get("conversation", ""))
+        if request.get("new"):
+            self.agent.persist()
+            self.agent.start_new()
+        elif wanted and wanted != self.agent.conversation.id:
+            self.agent.persist()
+            if self.agent.open(wanted) is None:
+                return {"ok": False, "error": f"no conversation {wanted}"}
         with self._turn_lock:
             self.turns += 1
+            self.publish("heard", text=text,
+                         conversation=self.agent.conversation.id)
             self.state = "thinking"
             try:
                 reply = self._run_agent(text)
@@ -289,7 +378,9 @@ class Assistant:
                 self.state = "idle"
         if request.get("speak", True) and reply:
             threading.Thread(target=self.say, args=(reply,), daemon=True).start()
-        return {"ok": True, "reply": reply}
+        return {"ok": True, "reply": reply,
+                "conversation": self.agent.conversation.id,
+                "title": self.agent.conversation.display_title()}
 
     def _cmd_say(self, request: dict) -> dict:
         text = str(request.get("text", "")).strip()
@@ -298,9 +389,105 @@ class Assistant:
         threading.Thread(target=self.say, args=(text,), daemon=True).start()
         return {"ok": True, "action": "speaking"}
 
+    def _cmd_confirm(self, request: dict) -> dict:
+        """A window answering a permission question raised by _confirm_in_ui."""
+        inbox = self._pending.get(str(request.get("id", "")))
+        if inbox is None:
+            return {"ok": False, "error": "that question is no longer waiting"}
+        try:
+            inbox.put_nowait(bool(request.get("allow", False)))
+        except queue.Full:
+            return {"ok": False, "error": "already answered"}
+        return {"ok": True}
+
     def _cmd_reset(self, request: dict) -> dict:
-        self.agent.reset()
-        return {"ok": True, "action": "conversation reset"}
+        self.agent.start_new()
+        self.publish("conversation", id=self.agent.conversation.id,
+                     title=self.agent.conversation.display_title())
+        return {"ok": True, "action": "conversation reset",
+                "conversation": self.agent.conversation.id}
+
+    # ---- conversations ----------------------------------------------------
+    def _cmd_conversations(self, request: dict) -> dict:
+        limit = int(request.get("limit", 50))
+        return {"ok": True, "current": self.agent.conversation.id,
+                "conversations": self.store.list(limit)}
+
+    def _cmd_conversation(self, request: dict) -> dict:
+        """Open, start, rename or delete a conversation."""
+        action = str(request.get("action", "open"))
+        conversation_id = str(request.get("id", ""))
+
+        if action == "new":
+            self.agent.persist()
+            conversation = self.agent.start_new(str(request.get("title", "")))
+        elif action == "open":
+            if conversation_id == self.agent.conversation.id:
+                conversation = self.agent.conversation
+            else:
+                self.agent.persist()
+                conversation = self.agent.open(conversation_id)
+                if conversation is None:
+                    return {"ok": False, "error": f"no conversation {conversation_id}"}
+        elif action == "delete":
+            if not self.store.delete(conversation_id):
+                return {"ok": False, "error": f"no conversation {conversation_id}"}
+            if conversation_id == self.agent.conversation.id:
+                self.agent.start_new()
+            conversation = self.agent.conversation
+        elif action == "rename":
+            target = (self.agent.conversation
+                      if conversation_id == self.agent.conversation.id
+                      else self.store.load(conversation_id))
+            if target is None:
+                return {"ok": False, "error": f"no conversation {conversation_id}"}
+            target.title = str(request.get("title", "")).strip()
+            self.store.save(target)
+            conversation = target
+        else:
+            return {"ok": False, "error": f"unknown action {action!r}"}
+
+        self.publish("conversation", id=self.agent.conversation.id,
+                     title=self.agent.conversation.display_title(),
+                     action=action)
+        return {"ok": True, "action": action, "id": conversation.id,
+                "title": conversation.display_title(),
+                "transcript": conversation.transcript()}
+
+    def _cmd_transcript(self, request: dict) -> dict:
+        conversation_id = str(request.get("id", "")) or self.agent.conversation.id
+        conversation = (self.agent.conversation
+                        if conversation_id == self.agent.conversation.id
+                        else self.store.load(conversation_id))
+        if conversation is None:
+            return {"ok": False, "error": f"no conversation {conversation_id}"}
+        return {"ok": True, "id": conversation.id,
+                "title": conversation.display_title(),
+                "transcript": conversation.transcript()}
+
+    def _cmd_config(self, request: dict) -> dict:
+        """Read and write settings, so the GUI never touches the file itself."""
+        action = str(request.get("action", "list"))
+        if action == "list":
+            return {"ok": True, "settings": self.config.flatten(),
+                    "path": str(self.config.path)}
+        if action == "set":
+            changes = dict(request.get("values") or {})
+            key = request.get("key")
+            if key is not None:
+                changes[str(key)] = request.get("value")
+            if not changes:
+                return {"ok": False, "error": "nothing to set"}
+            from .config import coerce
+            for name, value in changes.items():
+                current = self.config.get(name)
+                try:
+                    self.config.set(name, coerce(value, current), save=False)
+                except ValueError as exc:
+                    return {"ok": False, "error": f"{name}: {exc}"}
+            self.config.save()
+            return self._cmd_reload(request) | {"changed": sorted(changes)}
+        return {"ok": False, "error": f"unknown action {action!r}"}
 
     def _cmd_reload(self, request: dict) -> dict:
         """Re-read the config file and rebuild whatever changed."""
@@ -318,13 +505,16 @@ class Assistant:
                                           f"configuration: {exc}"}
 
         self.config = fresh
+        self.store = store_for(fresh)
+        self.agent.store = self.store
         self.player = Player(fresh)
-        self.voice = Speaker(self.tts, self.player,
-                             stream=bool(fresh.get("tts.stream", True)))
+        self.voice = Speaker.from_config(self.tts, self.player, fresh)
         self.agent.config = fresh
         self.agent.brain = self.brain
         self.agent.ctx.config = fresh
         self.agent.ctx.brain = self.brain
+        # The vision model is cached per-context; a config change must drop it.
+        self.agent.ctx.state.pop("vision", None)
 
         if self.wakeword is not None:
             self.wakeword.stop()

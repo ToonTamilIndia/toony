@@ -162,7 +162,14 @@ class TestSpeechChunking(unittest.TestCase):
         self.assertNotIn("*", spoken)
         self.assertNotIn("#", spoken)
         self.assertNotIn("https://", spoken)
-        self.assertIn("a link", spoken)
+        # The domain is named rather than reduced to "a link".
+        self.assertIn("example dot com", spoken)
+
+    def test_a_code_block_is_removed_before_sentences_are_found(self):
+        """Otherwise every full stop inside the code becomes its own utterance."""
+        chunks = list(sentences("Try this:\n```py\na = 1. b = 2. c = 3.\n```\nDone."))
+        self.assertTrue(all("a = 1" not in chunk for chunk in chunks))
+        self.assertIn("Done.", chunks)
 
     def test_very_long_sentences_are_split_on_commas(self):
         long_sentence = ", ".join(["a fairly long clause of words"] * 20) + "."
