@@ -99,6 +99,99 @@ class SingleInstance:
         self.path.unlink(missing_ok=True)
 
 
+_TRAY_TOOLTIP = {
+    "idle": "ready", "starting": "starting up", "listening": "listening",
+    "thinking": "thinking", "speaking": "speaking", "offline": "not running",
+}
+
+
+def _build_menu(app, window, client, config, orb, open_settings):
+    from PySide6.QtWidgets import QMenu
+
+    menu = QMenu()
+    _fill_menu(menu, app, window, client, config, orb, open_settings)
+    return menu
+
+
+def _fill_menu(menu, app, window, client, config, orb, open_settings) -> None:
+    """The menu behind the tray icon and the orb. Both show the same thing.
+
+    Everything here is something you would otherwise open a terminal for.
+    """
+    menu.addAction("Talk to Toony", window.start_listening)
+    menu.addAction("Stop talking", window.interrupt)
+    menu.addSeparator()
+    menu.addAction("Open the window", window.toggle_visible)
+    menu.addAction("New conversation", window.new_conversation)
+
+    recent = menu.addMenu("Recent conversations")
+    recent.aboutToShow.connect(lambda: _fill_recent(recent, client, window))
+
+    menu.addSeparator()
+    quick = menu.addMenu("Quick settings")
+    _add_toggle(quick, "Wake word", config, client, "wakeword.enabled")
+    _add_toggle(quick, "Stop when I talk over it", config, client,
+                "audio.barge_in")
+    _add_toggle(quick, "Speak replies", config, client, "tts.stream")
+    if orb is not None:
+        action = quick.addAction("Hide the orb")
+        action.triggered.connect(orb.hide)
+
+    personality = quick.addMenu("Personality")
+    for style in ("plain", "friendly", "spicy"):
+        action = personality.addAction(style.capitalize())
+        action.setCheckable(True)
+        action.setChecked(str(config.get("general.personality")) == style)
+        action.triggered.connect(
+            lambda _checked, s=style: _set(client, config,
+                                           "general.personality", s))
+
+    menu.addAction("Settings…", open_settings)
+    menu.addSeparator()
+    menu.addAction("Restart the assistant",
+                   lambda: client.send("reload", timeout=60))
+    menu.addAction("Quit", app.quit)
+
+
+def _add_toggle(menu, label: str, config, client, key: str) -> None:
+    action = menu.addAction(label)
+    action.setCheckable(True)
+    action.setChecked(bool(config.get(key)))
+    action.toggled.connect(lambda on: _set(client, config, key, on))
+
+
+def _set(client, config, key: str, value) -> None:
+    config.set(key, value, save=False)
+    client.send("config", timeout=60, action="set", values={key: value})
+
+
+def _fill_recent(menu, client, window) -> None:
+    """Filled when the submenu opens, so it is never stale."""
+    menu.clear()
+    pending = menu.addAction("Loading…")
+    pending.setEnabled(False)
+
+    def arrived(reply: dict) -> None:
+        menu.clear()
+        rows = reply.get("conversations", []) if reply.get("ok") else []
+        if not rows:
+            empty = menu.addAction("Nothing yet")
+            empty.setEnabled(False)
+            return
+        for row in rows[:8]:
+            action = menu.addAction(row.get("title", "Conversation"))
+            action.triggered.connect(
+                lambda _checked, i=row.get("id"): _open(window, i))
+
+    client.send("conversations", arrived, timeout=10, limit=8)
+
+
+def _open(window, conversation_id: str) -> None:
+    window.client.send("conversation", window._on_opened, timeout=15,
+                       action="open", id=conversation_id)
+    window.toggle_visible()
+
+
 def _notify_send(message: str) -> bool:
     """A desktop notification without Qt, for when there is no tray icon."""
     import shutil
@@ -126,6 +219,7 @@ def run(start_hidden: bool | None = None) -> int:
 
     from . import avatar
     from .client import DaemonClient
+    from .orb import build as build_orb
     from .settings import SettingsDialog
     from .window import ToonyWindow
 
@@ -141,6 +235,7 @@ def run(start_hidden: bool | None = None) -> int:
 
     accent = str(config.get("ui.accent", "#7c5cff"))
     url = str(config.get("ui.avatar_url", ""))
+    name = str(config.get("general.name", "Toony"))
     icon = avatar.window_icon(url, accent)
     app.setWindowIcon(icon)
 
@@ -182,32 +277,50 @@ def run(start_hidden: bool | None = None) -> int:
         config.data = Config.load().data
         window.config = config
         window.apply_style()
+        if orb is not None:
+            orb.config = config
+            orb.reload_avatar()
         window.refresh()
 
     window.on_settings = open_settings
 
-    # ---- tray -------------------------------------------------------------
+    # ---- the orb ----------------------------------------------------------
+    orb = build_orb(config)
+    if orb is not None:
+        orb.clicked.connect(window.start_listening)
+        orb.opened.connect(window.toggle_visible)
+        # Right-clicking the orb offers exactly what the tray does.
+        orb.build_menu = lambda menu: _fill_menu(menu, app, window, client,
+                                                 config, orb, open_settings)
+
+    def set_state(state: str) -> None:
+        """One state, three places: the window, the orb and the tray icon."""
+        if orb is not None:
+            orb.set_state(state)
+        if tray is not None:
+            tray.setIcon(avatar.state_icon(state, url, accent, name))
+            tray.setToolTip(f"{name} — {_TRAY_TOOLTIP.get(state, state)}")
+
+    def on_event(event: dict) -> None:
+        kind = str(event.get("event", ""))
+        if kind == "state":
+            set_state(str(event.get("state", "idle")))
+        elif kind == "confirm" and orb is not None:
+            orb.set_state("thinking")
+
+    client.event.connect(on_event)
+
+    # ---- tray ---------------------------------------------------------------
     tray = None
     if config.get("ui.tray", True) and QSystemTrayIcon.isSystemTrayAvailable():
-        tray = QSystemTrayIcon(icon, app)
-        tray.setToolTip("Toony")
-        menu = QMenu()
-        menu.addAction("Talk to Toony", window.start_listening)
-        menu.addAction("Stop talking", window.interrupt)
-        menu.addAction("Show / hide window", window.toggle_visible)
-        menu.addSeparator()
-        menu.addAction("New conversation", window.new_conversation)
-        menu.addAction("Settings…", open_settings)
-        menu.addSeparator()
-        menu.addAction("Stop the assistant",
-                       lambda: client.send("quit", timeout=10))
-        menu.addAction("Quit the window", app.quit)
+        tray = QSystemTrayIcon(avatar.state_icon("idle", url, accent, name), app)
+        tray.setToolTip(f"{name} — starting")
+        menu = _build_menu(app, window, client, config, orb, open_settings)
         tray.setContextMenu(menu)
         tray.activated.connect(
             lambda reason: window.toggle_visible()
             if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
         tray.show()
-        window.setStyleSheet(window.styleSheet())   # menus inherit the sheet
         menu.setStyleSheet(window.styleSheet())
 
     def notify(message: str) -> None:
@@ -222,8 +335,8 @@ def run(start_hidden: bool | None = None) -> int:
     window.on_attention = notify
 
     def on_connected(online: bool) -> None:
-        if tray is not None:
-            tray.setToolTip("Toony — ready" if online else "Toony — not running")
+        if not online:
+            set_state("offline")
 
     client.connected.connect(on_connected)
 
@@ -238,9 +351,11 @@ def run(start_hidden: bool | None = None) -> int:
     app.aboutToQuit.connect(window.remember_size)
 
     client.start()
+    if orb is not None:
+        orb.show_at_corner()
     hidden = (config.get("ui.start_minimised", True)
               if start_hidden is None else start_hidden)
-    if not hidden or tray is None:
+    if not hidden or (tray is None and orb is None):
         window.show()
         window.composer.setFocus()
     QTimer.singleShot(300, window.refresh)

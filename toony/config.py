@@ -274,6 +274,11 @@ DEFAULTS: dict[str, Any] = {
         "autostart": True,
         # Show the window whenever a voice turn begins.
         "pop_on_listen": True,
+        # The floating circle. A ring around it shows what Toony is doing:
+        # grey when idle, your accent colour while listening, amber while
+        # thinking, green while speaking. Click it to talk, Ctrl-drag to move.
+        "orb": True,
+        "orb_size": 76,
     },
 }
 

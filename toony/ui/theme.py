@@ -34,6 +34,24 @@ LIGHT = {
 }
 
 
+# What the ring around the orb says, at a glance, from across the room.
+STATES = {
+    "idle":      {"ring": "#5a5a72", "glow": "#5a5a72", "alpha": 0.45},
+    "starting":  {"ring": "#8a8aa0", "glow": "#8a8aa0", "alpha": 0.35},
+    "listening": {"ring": "#4ea8ff", "glow": "#4ea8ff", "alpha": 1.00},
+    "thinking":  {"ring": "#ffb454", "glow": "#ffb454", "alpha": 0.95},
+    "speaking":  {"ring": "#4ade80", "glow": "#4ade80", "alpha": 1.00},
+    "offline":   {"ring": "#ff6b6b", "glow": "#ff6b6b", "alpha": 0.55},
+}
+
+
+def state_colours(state: str, accent: str = "#7c5cff") -> dict:
+    colours = dict(STATES.get(state, STATES["idle"]))
+    if state == "listening":
+        colours["ring"] = colours["glow"] = accent
+    return colours
+
+
 def resolve(mode: str) -> str:
     """Turn 'auto' into 'dark' or 'light' by asking the running desktop."""
     if mode in ("dark", "light"):

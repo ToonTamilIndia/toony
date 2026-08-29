@@ -207,6 +207,46 @@ toony config set wakeword.similarity 0.65    # looser
 one-shot assistant in the foreground. Either way it continues the conversation
 you were already having, so follow-up questions work.
 
+## The orb
+
+A small circle that sits on your desktop. The ring around it is the whole
+point — you can tell what Toony is doing from across the room without reading
+anything:
+
+| ring | |
+|---|---|
+| grey, still | idle, waiting for you |
+| your accent colour, sweeping outward from the top | listening |
+| amber, a quarter chasing round | thinking |
+| green, the whole ring breathing | speaking |
+| red, dim | the daemon is not running |
+
+Click it to talk. Click again to stop it. Double-click opens the window,
+right-click gives you the same menu as the tray, and **Ctrl-drag** moves it —
+a plain drag would fight the click-to-talk.
+
+```bash
+toony config set ui.orb false      # turn it off
+toony config set ui.orb_size 96    # bigger
+toony config set ui.accent "#00d4ff"
+```
+
+It animates only while something is happening; idle costs nothing.
+
+## The tray
+
+The tray icon is the avatar with the same coloured ring, so it says what state
+Toony is in rather than just sitting there. Its menu carries everything you
+would otherwise open a terminal for:
+
+- talk, and stop talking
+- open the window, start a new conversation
+- **recent conversations**, filled fresh each time you open it — click one to
+  reopen it
+- quick settings: wake word, talk-over-to-interrupt, spoken replies, the orb,
+  and personality
+- full settings, restart the assistant, quit
+
 ## The window
 
 ```bash
@@ -551,7 +591,7 @@ toony/
 ├── history.py        conversations on disk: save, list, reopen, prune
 ├── text.py           making written text worth listening to
 ├── bridges/          telegram: long polling, pairing, backlog limits
-├── ui/               the window: tray, chat, conversations, settings, avatar
+├── ui/               orb, tray, window, settings, avatar, event client
 ├── audio/            devices, capture with endpointing, VAD, playback, wake word
 ├── brain/            claude · openai_compat (also Ollama) · prompts
 ├── stt/              local_whisper · cloud_whisper

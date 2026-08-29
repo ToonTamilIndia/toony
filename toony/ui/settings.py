@@ -105,6 +105,11 @@ HINTS: dict[str, tuple] = {
                                 "window, because Wayland has no window opacity."),
     "ui.frameless": (None, "Use Toony's own title bar. Turn it off for the "
                            "normal KDE one if dragging misbehaves."),
+    "ui.orb": (None, "A floating circle whose ring shows what Toony is doing. "
+                     "Click it to talk, Ctrl-drag to move it."),
+    "ui.orb_size": ((48, 160), "How big the floating circle is."),
+    "ui.accent": (None, "The colour of the ring while it listens, and of "
+                        "buttons and selections."),
     "ui.font_size": ((10, 22), ""),
     "general.reply_word_target": ((15, 200),
                                   "Spoken answers are kept near this length."),

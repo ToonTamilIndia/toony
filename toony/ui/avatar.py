@@ -103,6 +103,64 @@ def circular_pixmap(size: int = 64, url: str = "", accent: str = "#7c5cff",
     return QPixmap.fromImage(circular_image(size, url, accent, letter))
 
 
+def state_image(size: int, state: str, url: str = "", accent: str = "#7c5cff",
+                letter: str = "T"):
+    """The avatar with a state-coloured ring, for the tray.
+
+    A tray icon that never changes tells you nothing. This one says at a glance
+    whether Toony is listening, thinking, talking or asleep — which is most of
+    what anybody wants from a tray icon.
+    """
+    from PySide6.QtCore import QRectF, Qt
+    from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+
+    from . import theme
+
+    ring = max(2.0, size * 0.11)
+    inner = int(size - ring * 2.4)
+    base = circular_image(inner, url, accent, letter)
+    if base is None:
+        return None
+
+    image = base.copy(0, 0, size, size)
+    image.fill(Qt.transparent)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.Antialiasing)
+    painter.setRenderHint(QPainter.SmoothPixmapTransform)
+
+    offset = (size - inner) / 2
+    box = QRectF(offset, offset, inner, inner)
+    clip = QPainterPath()
+    clip.addEllipse(box)
+    painter.save()
+    painter.setClipPath(clip)
+    painter.drawImage(box, base)
+    painter.restore()
+
+    colours = theme.state_colours(state, accent)
+    colour = QColor(colours["ring"])
+    colour.setAlphaF(colours["alpha"])
+    painter.setBrush(Qt.NoBrush)
+    painter.setPen(QPen(colour, ring, Qt.SolidLine, Qt.RoundCap))
+    edge = ring / 2 + 0.5
+    painter.drawEllipse(QRectF(edge, edge, size - ring - 1, size - ring - 1))
+    painter.end()
+    return image
+
+
+def state_icon(state: str, url: str = "", accent: str = "#7c5cff",
+               letter: str = "T"):
+    """A tray icon for one state, at the sizes a panel might ask for."""
+    from PySide6.QtGui import QIcon, QPixmap
+
+    icon = QIcon()
+    for size in (22, 24, 32, 48, 64):
+        image = state_image(size, state, url, accent, letter)
+        if image is not None:
+            icon.addPixmap(QPixmap.fromImage(image))
+    return icon
+
+
 def window_icon(url: str = "", accent: str = "#7c5cff"):
     from PySide6.QtGui import QIcon
 

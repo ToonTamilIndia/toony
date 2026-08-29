@@ -199,6 +199,85 @@ class TestTheme(unittest.TestCase):
         self.assertEqual(self.theme.resolve("dark"), "dark")
 
 
+class TestOrbStates(unittest.TestCase):
+    """The ring is the whole point: each state must look different."""
+
+    def setUp(self):
+        from toony.ui import theme
+
+        self.theme = theme
+
+    def test_every_state_has_a_colour(self):
+        for state in ("idle", "starting", "listening", "thinking", "speaking",
+                      "offline"):
+            with self.subTest(state=state):
+                colours = self.theme.state_colours(state)
+                self.assertTrue(colours["ring"].startswith("#"))
+                self.assertGreater(colours["alpha"], 0)
+
+    def test_busy_states_are_distinguishable_from_each_other(self):
+        rings = {s: self.theme.state_colours(s)["ring"]
+                 for s in ("idle", "listening", "thinking", "speaking")}
+        self.assertEqual(len(set(rings.values())), 4, rings)
+
+    def test_listening_takes_the_accent_colour(self):
+        self.assertEqual(self.theme.state_colours("listening", "#ff0000")["ring"],
+                         "#ff0000")
+
+    def test_an_unknown_state_falls_back_to_idle(self):
+        self.assertEqual(self.theme.state_colours("nonsense"),
+                         self.theme.state_colours("idle"))
+
+    def test_idle_is_dimmer_than_listening(self):
+        self.assertLess(self.theme.state_colours("idle")["alpha"],
+                        self.theme.state_colours("listening")["alpha"])
+
+
+class TestOrbGeometry(unittest.TestCase):
+    """The arc maths, which is ordinary Python and worth checking."""
+
+    def _orb(self, state="idle"):
+        from toony.config import Config
+        from toony.ui.orb import Orb
+
+        orb = Orb.__new__(Orb)
+        orb.config = Config()
+        orb.state = state
+        orb._phase = 0.25
+        orb._level = 1.0
+        return orb
+
+    def test_idle_draws_no_bright_arc(self):
+        self.assertEqual(self._orb("idle")._span(), 0.0)
+
+    def test_speaking_fills_the_whole_ring(self):
+        self.assertEqual(self._orb("speaking")._span(), 360.0)
+
+    def test_thinking_chases_a_quarter_around(self):
+        orb = self._orb("thinking")
+        self.assertEqual(orb._span(), 90.0)
+        first = orb._start()
+        orb._phase += 0.5
+        self.assertNotEqual(orb._start(), first)
+
+    def test_listening_grows_but_never_overflows(self):
+        orb = self._orb("listening")
+        for phase in (0.0, 0.25, 0.5, 0.75, 1.0):
+            orb._phase = phase
+            with self.subTest(phase=phase):
+                self.assertGreaterEqual(orb._span(), 0.0)
+                self.assertLessEqual(orb._span(), 360.0)
+
+    def test_the_pulse_stays_between_zero_and_one(self):
+        for state in ("idle", "listening", "thinking", "speaking"):
+            orb = self._orb(state)
+            for phase in (0.0, 0.3, 0.7, 1.4, 9.9):
+                orb._phase = phase
+                with self.subTest(state=state, phase=phase):
+                    self.assertGreaterEqual(orb._pulse(), 0.0)
+                    self.assertLessEqual(orb._pulse(), 1.0)
+
+
 class TestSettingsHints(unittest.TestCase):
     def setUp(self):
         from toony.config import Config
