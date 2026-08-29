@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from ..log import get
-from .base import Brain, BrainError, BrainReply, Message, ToolCall, ToolSpec
+from .base import Brain, BrainError, InvalidRequest, BrainReply, Message, ToolCall, ToolSpec
 
 log = get("brain.claude")
 
@@ -78,6 +78,10 @@ class ClaudeBrain(Brain):
         try:
             response = endpoint.create(**params)
         except self._anthropic.APIStatusError as exc:
+            if getattr(exc, "status_code", 0) == 400:
+                # The transcript itself was refused; retrying it unchanged will
+                # fail identically, so the agent needs to know to drop it.
+                raise InvalidRequest(_explain(exc)) from exc
             raise BrainError(_explain(exc)) from exc
         except self._anthropic.APIConnectionError as exc:
             raise BrainError("I could not reach the Claude API.") from exc
@@ -97,6 +101,10 @@ class ClaudeBrain(Brain):
                         pass
                 response = stream.get_final_message()
         except self._anthropic.APIStatusError as exc:
+            if getattr(exc, "status_code", 0) == 400:
+                # The transcript itself was refused; retrying it unchanged will
+                # fail identically, so the agent needs to know to drop it.
+                raise InvalidRequest(_explain(exc)) from exc
             raise BrainError(_explain(exc)) from exc
         except self._anthropic.APIConnectionError as exc:
             raise BrainError("I could not reach the Claude API.") from exc

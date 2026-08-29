@@ -7,6 +7,7 @@ working, open it mid-sentence and it catches up.
 
 from __future__ import annotations
 
+import os
 import time
 
 from PySide6.QtCore import QPoint, QSize, Qt, QTimer, Signal
@@ -19,6 +20,13 @@ from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QListWidget,
 from ..log import get
 from . import avatar, theme
 
+
+def _wayland() -> bool:
+    from PySide6.QtGui import QGuiApplication
+
+    app = QGuiApplication.instance()
+    return bool(app and app.platformName().startswith("wayland"))
+
 log = get("ui.window")
 
 _STATUS = {
@@ -29,6 +37,42 @@ _STATUS = {
     "speaking": ("Speaking…", "good"),
     "offline": ("Not running", "danger"),
 }
+
+
+class Header(QWidget):
+    """The title bar. Dragging it moves the window.
+
+    On Wayland an application may not place its own window: `move()` does
+    nothing and the compositor ignores it. `startSystemMove()` asks the
+    compositor to do the dragging instead, which is the only thing that works
+    there — and works on X11 too, so there is no branch.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("header")
+        self._press: QPoint | None = None
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+        window = self.window()
+        handle = window.windowHandle()
+        if handle is not None and handle.startSystemMove():
+            return
+        # X11 without the protocol, or an odd compositor: move it ourselves.
+        self._press = event.globalPosition().toPoint() - window.pos()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._press is not None and event.buttons() & Qt.LeftButton:
+            self.window().move(event.globalPosition().toPoint() - self._press)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._press = None
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        window = self.window()
+        window.showNormal() if window.isMaximized() else window.showMaximized()
 
 
 class Bubble(QLabel):
@@ -76,21 +120,27 @@ class Composer(QTextEdit):
 class ToonyWindow(QWidget):
     """The main window. It owns no state the daemon does not also have."""
 
-    def __init__(self, config, client, on_settings=None, on_quit=None):
+    def __init__(self, config, client, on_settings=None, on_quit=None,
+                 on_attention=None):
         super().__init__()
         self.config = config
         self.client = client
         self.on_settings = on_settings
         self.on_quit = on_quit
+        # Called when the window could not raise itself and something still
+        # needs the user's eyes. Wired to a desktop notification.
+        self.on_attention = on_attention
         self.current_conversation = ""
         self.pending_confirm = ""
         self.busy = False
-        self._drag_from: QPoint | None = None
         self._thinking: Bubble | None = None
+        self._live: Bubble | None = None
 
         self.setWindowTitle(str(config.get("general.name", "Toony")))
-        self.setWindowFlag(Qt.FramelessWindowHint, True)
-        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.frameless = bool(config.get("ui.frameless", True))
+        if self.frameless:
+            self.setWindowFlag(Qt.FramelessWindowHint, True)
+            self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setMinimumSize(380, 420)
         self.resize(int(config.get("ui.width", 460)),
                     int(config.get("ui.height", 640)))
@@ -119,7 +169,7 @@ class ToonyWindow(QWidget):
         layout.addLayout(body, 1)
 
     def _header(self) -> QWidget:
-        header = QWidget(objectName="header")
+        header = Header()
         header.setFixedHeight(58)
         row = QHBoxLayout(header)
         row.setContentsMargins(12, 8, 8, 8)
@@ -250,10 +300,7 @@ class ToonyWindow(QWidget):
     # ---- appearance -------------------------------------------------------
     def apply_style(self) -> None:
         accent = str(self.config.get("ui.accent", "#7c5cff"))
-        self.setStyleSheet(theme.stylesheet(
-            str(self.config.get("ui.theme", "auto")), accent,
-            int(self.config.get("ui.font_size", 14))))
-        self.setWindowOpacity(self._opacity())
+        self.set_opacity(self._opacity(), accent=accent)
         self.setWindowFlag(Qt.WindowStaysOnTopHint,
                            bool(self.config.get("ui.always_on_top", False)))
         self.avatar_label.setPixmap(avatar.circular_pixmap(
@@ -267,8 +314,17 @@ class ToonyWindow(QWidget):
             return 0.97
         return min(1.0, max(0.35, value))     # never let it become invisible
 
-    def set_opacity(self, value: float) -> None:
-        self.setWindowOpacity(min(1.0, max(0.35, value)))
+    def set_opacity(self, value: float, accent: str | None = None) -> None:
+        """Apply translucency the way this platform actually supports it."""
+        value = min(1.0, max(0.35, value))
+        accent = accent or str(self.config.get("ui.accent", "#7c5cff"))
+        painted = self.frameless and _wayland()
+        self.setStyleSheet(theme.stylesheet(
+            str(self.config.get("ui.theme", "auto")), accent,
+            int(self.config.get("ui.font_size", 14)),
+            opacity=value if painted else 1.0))
+        # A no-op under Wayland, which is why the colours carry it there.
+        self.setWindowOpacity(1.0 if painted else value)
 
     # ---- daemon events ----------------------------------------------------
     def on_connected(self, online: bool) -> None:
@@ -283,14 +339,19 @@ class ToonyWindow(QWidget):
             self._set_status(str(event.get("state", "idle")))
         elif kind == "heard":
             self._clear_thinking()
+            self._live = None
             self.add_bubble(str(event.get("text", "")), "user")
             self._show_thinking()
+        elif kind == "reply_chunk":
+            self._append_live(str(event.get("text", "")))
         elif kind == "reply":
-            self._clear_thinking()
-            self.add_bubble(str(event.get("text", "")), "toony")
+            self._finish_live(str(event.get("text", "")))
             if event.get("conversation") != self.current_conversation:
                 self.current_conversation = str(event.get("conversation", ""))
             self.load_conversations()
+        elif kind == "interrupted":
+            self._clear_thinking()
+            self._set_status("idle")
         elif kind == "tool":
             self.add_bubble(_tool_line(event), "tool")
         elif kind == "confirm":
@@ -303,7 +364,7 @@ class ToonyWindow(QWidget):
             self.load_conversations()
         elif kind == "listen_requested":
             if self.config.get("ui.pop_on_listen", True):
-                self.pop_up()
+                self.pop_up(str(event.get("activation_token", "")))
         elif kind == "subscribed":
             self.refresh()
 
@@ -359,7 +420,9 @@ class ToonyWindow(QWidget):
         self._clear_thinking()
         if reply.get("ok"):
             # The event stream usually beat us here; only speak up if it did not.
-            if not self._last_was(str(reply.get("reply", ""))):
+            if self._live is not None:
+                self._finish_live(str(reply.get("reply", "")))
+            elif not self._last_was(str(reply.get("reply", ""))):
                 self.add_bubble(str(reply.get("reply", "")), "toony")
             self.current_conversation = str(reply.get("conversation",
                                                       self.current_conversation))
@@ -439,7 +502,9 @@ class ToonyWindow(QWidget):
         self.pending_confirm = request_id
         self.permission_label.setText(question)
         self.permission.setVisible(True)
-        self.pop_up()
+        # This one matters: an unanswered question times out. If the window
+        # cannot come forward, a notification has to carry it.
+        self.attention(question)
 
     def answer_permission(self, allow: bool) -> None:
         if self.pending_confirm:
@@ -452,9 +517,13 @@ class ToonyWindow(QWidget):
     def add_bubble(self, text: str, kind: str = "toony", scroll: bool = True) -> None:
         if not text.strip():
             return
+        self._add_widget(Bubble(text.strip(), kind), kind)
+        if scroll:
+            QTimer.singleShot(0, self._scroll_to_end)
+
+    def _add_widget(self, bubble: Bubble, kind: str) -> Bubble:
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
-        bubble = Bubble(text.strip(), kind)
         bubble.setMaximumWidth(max(240, int(self.width() * 0.74)))
         if kind == "user":
             row.addStretch(1)
@@ -463,8 +532,7 @@ class ToonyWindow(QWidget):
             row.addWidget(bubble)
             row.addStretch(1)
         self.messages.insertLayout(self.messages.count() - 1, row)
-        if scroll:
-            QTimer.singleShot(0, self._scroll_to_end)
+        return bubble
 
     def _last_was(self, text: str) -> bool:
         for index in range(self.messages.count() - 2, -1, -1):
@@ -477,6 +545,31 @@ class ToonyWindow(QWidget):
                 if isinstance(widget, Bubble):
                     return widget.text().strip() == text.strip()
         return False
+
+    # ---- text arriving a token at a time ----------------------------------
+    def _append_live(self, chunk: str) -> None:
+        """Grow one bubble as the model writes, rather than waiting for the end."""
+        if not chunk:
+            return
+        self._clear_thinking()
+        if self._live is None:
+            self._live = self._add_widget(Bubble("", "toony"), "toony")
+        self._live.setText(self._live.text() + chunk)
+        QTimer.singleShot(0, self._scroll_to_end)
+
+    def _finish_live(self, text: str) -> None:
+        """The final reply. Replaces whatever streamed, so the two cannot differ."""
+        self._clear_thinking()
+        if self._live is not None:
+            if text:
+                self._live.setText(text)
+            elif not self._live.text().strip():
+                self._live.setParent(None)
+                self._live.deleteLater()
+            self._live = None
+            QTimer.singleShot(0, self._scroll_to_end)
+            return
+        self.add_bubble(text, "toony")
 
     def _show_thinking(self) -> None:
         self._clear_thinking()
@@ -497,6 +590,7 @@ class ToonyWindow(QWidget):
 
     def clear_messages(self) -> None:
         self._clear_thinking()
+        self._live = None
         while self.messages.count() > 1:
             item = self.messages.takeAt(0)
             layout = item.layout()
@@ -518,41 +612,63 @@ class ToonyWindow(QWidget):
         if self.conversation_list.isVisible():
             self.load_conversations()
 
-    def pop_up(self) -> None:
-        """Bring the window forward without stealing focus from typing."""
-        if not self.isVisible():
+    def pop_up(self, token: str = "") -> bool:
+        """Bring the window forward. Returns whether it could take focus.
+
+        Under Wayland a client may not focus itself: `activateWindow()` and
+        `raise_()` are silently ignored, and KDE is strict about it. The one
+        way in is an xdg-activation token, granted by the compositor to
+        whoever has focus and passed to us. `toony listen` is spawned by the
+        compositor, so it holds one; it arrives here through the daemon.
+
+        Qt spends the token from the environment, and it is single-use, so it
+        is set immediately before activating and cleared straight after.
+        """
+        showing = self.isVisible()
+        if not showing:
             self.show()
         self.raise_()
-        self.activateWindow()
 
-    def toggle_visible(self) -> None:
+        wayland = _wayland()
+        if token:
+            os.environ["XDG_ACTIVATION_TOKEN"] = token
+        try:
+            handle = self.windowHandle()
+            if handle is not None:
+                handle.requestActivate()
+            else:
+                self.activateWindow()
+        finally:
+            if token:
+                os.environ.pop("XDG_ACTIVATION_TOKEN", None)
+
+        if wayland and not token:
+            # Say so rather than assuming: the window is up, but behind
+            # whatever has focus, and nothing we can do here changes that.
+            log.debug("no activation token — the window may stay in the "
+                      "background under Wayland")
+            return False
+        return True
+
+    def attention(self, message: str, token: str = "") -> None:
+        """Get looked at. Falls back to a notification when focus is refused."""
+        if self.pop_up(token):
+            return
+        if self.on_attention:
+            self.on_attention(message)
+
+    def toggle_visible(self, token: str = "") -> None:
+        """From the tray, so this click is our own: activation is allowed."""
         if self.isVisible() and not self.isMinimized():
             self.hide()
         else:
             self.showNormal()
-            self.pop_up()
+            self.pop_up(token)
             self.composer.setFocus()
 
     def sizeHint(self) -> QSize:
         return QSize(int(self.config.get("ui.width", 460)),
                      int(self.config.get("ui.height", 640)))
-
-    def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.LeftButton and event.position().y() < 58:
-            handle = self.windowHandle()
-            if handle is not None and handle.startSystemMove():
-                return          # Wayland: only the compositor may move a window
-            self._drag_from = event.globalPosition().toPoint() - self.pos()
-        super().mousePressEvent(event)
-
-    def mouseMoveEvent(self, event) -> None:
-        if self._drag_from is not None and event.buttons() & Qt.LeftButton:
-            self.move(event.globalPosition().toPoint() - self._drag_from)
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event) -> None:
-        self._drag_from = None
-        super().mouseReleaseEvent(event)
 
     def closeEvent(self, event) -> None:
         """Closing hides; Toony is meant to stay running all day."""

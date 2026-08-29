@@ -49,6 +49,49 @@ sudo dnf install wireplumber playerctl spectacle wl-clipboard libnotify \
     brightnessctl NetworkManager-tui bluez power-profiles-daemon
 ```
 
+## Start here
+
+```bash
+./install.sh
+toony setup          # every choice, one question at a time
+```
+
+`toony setup` asks six things in plain language — local or cloud, where speech
+runs, a wake phrase, personality, whether you write code, whether it should stop
+talking when you talk over it — then installs the service and the hotkey and
+offers to set up the phone bot. Everything it sets can be changed later in the
+window or with `toony config set`.
+
+## Talking to it from your phone
+
+```bash
+toony telegram setup
+```
+
+It walks you through @BotFather, checks the token works, and prints a pairing
+code. Send that code to your bot and your phone is connected — the same
+assistant, the same tools, the same conversations.
+
+Until a chat sends the code, **every message is refused**. A bot token is a URL
+anybody can use, so the token alone must not be enough to drive your laptop.
+
+```bash
+toony telegram status        # token, internet, paired chats, live counters
+toony telegram pair          # show the code again, or --new-code for a fresh one
+toony telegram allow 12345   # pair a chat id directly
+toony telegram off
+```
+
+**When the laptop is offline**, Telegram holds your messages for us and delivers
+them on reconnect. A short queue is answered normally. Past
+`telegram.max_backlog` (20 by default) the older ones get an apology instead —
+an hour-old pile of messages is not a conversation, and answering it as one is
+worse than being honest. A single message over `telegram.max_message_chars`
+(4,000) is refused the same way, since it will not fit through the Bot API and
+is not worth a model's time either.
+
+Long answers are split across messages rather than truncated.
+
 ## Local or cloud, in one command
 
 ```bash
@@ -379,7 +422,19 @@ fails immediately rather than hanging.
 
 ## Not being talked at
 
-Two things stop a four-paragraph answer being read out in full.
+**Just talk over it.** Speaking while Toony is speaking stops it mid-sentence
+and starts listening to you. The threshold is deliberately above the ordinary
+one so the microphone does not trigger on the speakers; with headphones it is
+exact, and over laptop speakers you may need:
+
+```bash
+toony config set audio.barge_in_sensitivity 4     # if it interrupts itself
+toony config set audio.barge_in false             # or turn it off
+```
+
+`Escape`, `Ctrl+.`, the ■ button and `toony cancel` all do the same thing.
+
+Two more things stop a four-paragraph answer being read out in full.
 
 ```bash
 toony config set general.reply_word_target 40    # ask for shorter answers
@@ -400,6 +455,32 @@ a screen produces things a synthesiser reads out letter by letter:
 | `**bold**`, bullets, emoji | gone |
 
 `toony config set tts.speakable false` turns it off.
+
+## Speed
+
+Two settings account for most of the wait.
+
+**Speaking starts at the first word**, not when the whole reply is finished.
+On a local model that is the difference between half a second and thirty
+seconds of silence. The log shows both numbers:
+
+```
+answered in 24.2s (first word after 0.9s) after 0 tool round(s)
+```
+
+**Independent read-only tools run at the same time.** "What is the volume, the
+battery and the time" is one round trip, not three. Anything that asks
+permission or writes a file still runs one at a time — two spoken permission
+questions at once is not a conversation.
+
+```bash
+toony config set brain.stream_from_start true    # the default
+toony config set brain.parallel_tools true       # the default
+toony config set tools.max_parallel 4
+```
+
+If answers themselves are slow, that is the model. `toony use hybrid` moves the
+brain to Claude and keeps speech local.
 
 ## Configuration
 
@@ -469,6 +550,7 @@ toony/
 ├── cli.py            every `toony` subcommand
 ├── history.py        conversations on disk: save, list, reopen, prune
 ├── text.py           making written text worth listening to
+├── bridges/          telegram: long polling, pairing, backlog limits
 ├── ui/               the window: tray, chat, conversations, settings, avatar
 ├── audio/            devices, capture with endpointing, VAD, playback, wake word
 ├── brain/            claude · openai_compat (also Ollama) · prompts
@@ -530,9 +612,53 @@ without CUDA, which openWakeWord asks for regardless. Harmless — the wake-word
 model is 80 milliseconds of audio at a time and runs fine on the CPU. Toony now
 silences it.
 
-**The wake word never fires.** `toony wakeword` shows the phrase and engine.
-openWakeWord only knows its own trained phrases, so if you asked for "hey toony"
-make sure the engine is `whisper`. Then lower `wakeword.similarity`.
+**The wake word never fires, or fires at everything.** `toony wakeword` shows
+the phrase and engine. openWakeWord only knows its own trained phrases — if you
+asked for "hey toony" and it is still loading `hey_jarvis`, it is matching a
+different phrase entirely and will trigger on anything that sounds like it. Run
+`toony wakeword "hey toony"` to switch to the whisper engine, then tune
+`wakeword.similarity`.
+
+**`Library libcublas.so.12 is not found or cannot be loaded`.** faster-whisper
+on the GPU needs the CUDA maths libraries. Toony now loads them itself from
+site-packages, and falls back to the CPU rather than losing the turn if it
+cannot. To get the GPU back:
+
+```bash
+pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+toony install && systemctl --user restart toony
+toony doctor            # the "CUDA libraries" line says whether it worked
+```
+
+`toony install` rewrites `toony.service` every time, so edits to it are lost.
+Put your own `Environment=` lines in `~/.config/systemd/user/toony.service.d/override.conf`
+instead — that file is created once and never overwritten.
+
+**The window will not move, or opacity does nothing.** Both are Wayland: an
+application may not place its own window, and there is no per-window opacity.
+Toony asks the compositor to do the dragging (drag the top bar) and paints the
+translucency into the background instead. If dragging still misbehaves, take the
+normal KDE title bar: `toony config set ui.frameless false`.
+
+**The window comes up behind whatever I am working in.** Also Wayland, and
+deliberate: a client may not focus itself, so `activateWindow()` is ignored.
+The way in is an xdg-activation token, which the compositor gives to whoever
+already has focus. Toony's hotkey is *run by* the compositor, so `toony listen`
+is handed one — it passes it to the daemon, which passes it to the window,
+which spends it. A second `toony gui` lends its token to the one already
+running, so clicking the launcher again raises it properly.
+
+Nothing that starts inside the daemon can have a token, so a permission
+question that cannot raise the window falls back to a desktop notification,
+which the compositor always shows.
+
+**`invalid message content type: <nil>`** from Ollama. An assistant message
+that only calls a tool has no text, and OpenAI allows `content: null` there
+while Ollama's compatibility layer does not. Fixed — but note the shape of the
+bug: the transcript is stored, so one bad turn broke every turn afterwards,
+including `toony ask`. Toony now recognises a rejected transcript, starts a
+fresh conversation and retries the question once, so it can no longer wedge
+permanently.
 
 **It does not remember what I just said.** Check `toony status` shows a daemon
 and a conversation. `toony conversations` lists what has been saved.

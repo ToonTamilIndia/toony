@@ -13,6 +13,7 @@ assistant never hears itself.
 from __future__ import annotations
 
 import difflib
+import inspect
 import re
 import threading
 import time
@@ -52,6 +53,53 @@ class Detector:
         return "ready"
 
 
+def _openwakeword_paths(name: str, model_dir: Path) -> list[str]:
+    """Turn a model name into real file paths.
+
+    openWakeWord 0.4 takes ``wakeword_model_paths`` and will not look a bundled
+    name up for you; 0.5 renamed the argument to ``wakeword_models`` and accepts
+    either. Resolving to a path first works on both.
+    """
+    custom = model_dir / f"{name}.onnx"
+    if custom.is_file():
+        return [str(custom)]
+    for suffix in (".tflite", ".onnx"):
+        candidate = model_dir / f"{name}{suffix}"
+        if candidate.is_file():
+            return [str(candidate)]
+    if Path(name).is_file():
+        return [name]
+
+    try:
+        import openwakeword
+    except ImportError:
+        return []
+
+    # The bundled models are indexed in openwakeword.MODELS on every version
+    # that has them; the key is sometimes the pretty name, sometimes the slug.
+    registry = getattr(openwakeword, "MODELS", {}) or {}
+    for key, entry in registry.items():
+        slug = re.sub(r"[^a-z0-9]+", "_", str(key).lower()).strip("_")
+        if slug != name.lower() and str(key) != name:
+            continue
+        path = entry.get("model_path") if isinstance(entry, dict) else entry
+        if path and Path(str(path)).is_file():
+            return [str(path)]
+
+    # Last resort: look through the package's own resources.
+    package = Path(getattr(openwakeword, "__file__", "") or "").parent
+    for base in (package / "resources" / "models", package / "models"):
+        if not base.is_dir():
+            continue
+        for suffix in ("onnx", "tflite"):
+            hits = sorted(base.glob(f"{name}*.{suffix}"))
+            hits = [h for h in hits if "melspectrogram" not in h.name
+                    and "embedding" not in h.name]
+            if hits:
+                return [str(hits[0])]
+    return []
+
+
 class OpenWakeWordDetector(Detector):
     name = "openwakeword"
 
@@ -67,6 +115,8 @@ class OpenWakeWordDetector(Detector):
 
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message=".*CUDAExecutionProvider.*")
+            warnings.filterwarnings("ignore", category=UserWarning,
+                                    module="onnxruntime.*")
             try:
                 from openwakeword.model import Model
             except ImportError as exc:
@@ -75,37 +125,46 @@ class OpenWakeWordDetector(Detector):
 
             name = str(config.get("wakeword.model", "hey_jarvis"))
             directory = Path(str(config.get("wakeword.model_dir", ""))).expanduser()
-            custom = directory / f"{name}.onnx"
+            paths = _openwakeword_paths(name, directory)
+            if not paths:
+                raise RuntimeError(
+                    f"openWakeWord has no model called {name!r}, and there is no "
+                    f"{name}.onnx in {directory}. Either download one "
+                    f"(python -m openwakeword.utils.download_models), or switch "
+                    f"to the whisper engine, which matches any phrase: "
+                    f"toony wakeword \"hey toony\"")
+
+            log.info("loading wake word model %s", paths[0])
             try:
-                if custom.is_file():
-                    log.info("loading custom wake word model %s", custom)
-                    return Model(wakeword_model_paths=[str(custom)])
-                if Path(name).is_file():
-                    return Model(wakeword_model_paths=[name])
-                if name not in _BUNDLED:
-                    raise RuntimeError(
-                        f"openWakeWord has no model called {name!r}. Either train "
-                        f"one, or switch to the whisper engine, which matches any "
-                        f"phrase: toony wakeword \"hey toony\"")
-                import openwakeword
-                bundled = (Path(openwakeword.__file__).parent
-                           / "resources" / "models" / f"{name}.onnx")
-                if not bundled.is_file():
-                    matches = sorted(
-                        (Path(openwakeword.__file__).parent
-                         / "resources" / "models").glob(f"{name}*.onnx"))
-                    if matches:
-                        bundled = matches[0]
-                    else:
-                        raise RuntimeError(
-                            f"no bundled model file found for {name!r}")
-                log.info("loading bundled wake word model %s", bundled.name)
-                return Model(wakeword_model_paths=[str(bundled)])
-            except RuntimeError:
-                raise
+                return Model(**self._argument(Model, paths),
+                             **self._framework(Model, paths[0]))
             except Exception as exc:
                 raise RuntimeError(
-                    f"could not load wake word model {name!r}: {exc}") from exc
+                    f"could not load wake word model {paths[0]}: {exc}") from exc
+
+    @staticmethod
+    def _argument(model_class, paths: list[str]) -> dict:
+        """0.4 calls it wakeword_model_paths; 0.5 calls it wakeword_models."""
+        try:
+            parameters = inspect.signature(model_class.__init__).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "wakeword_models" in parameters:
+            return {"wakeword_models": paths}
+        if "wakeword_model_paths" in parameters:
+            return {"wakeword_model_paths": paths}
+        return {"wakeword_models": paths}
+
+    @staticmethod
+    def _framework(model_class, path: str) -> dict:
+        """Match the runtime to the file, or a .onnx model loads as tflite."""
+        try:
+            parameters = inspect.signature(model_class.__init__).parameters
+        except (TypeError, ValueError):
+            return {}
+        if "inference_framework" not in parameters:
+            return {}
+        return {"inference_framework": "onnx" if path.endswith(".onnx") else "tflite"}
 
     def feed(self, pcm: bytes) -> str | None:
         import numpy as np

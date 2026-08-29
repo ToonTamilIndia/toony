@@ -11,7 +11,8 @@ import json
 from typing import Any, Callable
 
 from ..log import get
-from .base import Brain, BrainError, BrainReply, Message, ToolCall, ToolSpec
+from .base import (Brain, BrainError, BrainReply, InvalidRequest,
+                   Message, ToolCall, ToolSpec)
 
 log = get("brain.openai")
 
@@ -48,7 +49,8 @@ class OpenAICompatBrain(Brain):
                 for block in tool_results:
                     out.append({"role": "tool",
                                 "tool_call_id": block["tool_use_id"],
-                                "content": str(block.get("content", ""))})
+                                "content": str(block.get("content") or
+                                               "(the tool returned nothing)")})
                 continue
 
             if msg.role == "assistant":
@@ -58,7 +60,11 @@ class OpenAICompatBrain(Brain):
                           "function": {"name": b["name"],
                                        "arguments": json.dumps(b.get("input") or {})}}
                          for b in msg.content if b.get("type") == "tool_use"]
-                entry: dict[str, Any] = {"role": "assistant", "content": text or None}
+                # An empty string, never null. OpenAI allows null content
+                # beside tool_calls; Ollama's compatibility layer rejects it
+                # with "invalid message content type: <nil>", and because the
+                # conversation is stored, that then breaks every later turn.
+                entry: dict[str, Any] = {"role": "assistant", "content": text}
                 if calls:
                     entry["tool_calls"] = calls
                 out.append(entry)
@@ -100,7 +106,8 @@ class OpenAICompatBrain(Brain):
                 self._token_param = "max_completion_tokens"
                 params["max_completion_tokens"] = params.pop("max_tokens")
                 return self.client.chat.completions.create(stream=stream, **params)
-            raise BrainError(f"The model rejected the request: {exc}") from exc
+            raise InvalidRequest(
+                f"The model rejected the request: {exc}") from exc
         except self._openai.AuthenticationError as exc:
             raise BrainError("My API key for that model was rejected.") from exc
         except self._openai.APIConnectionError as exc:

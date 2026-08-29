@@ -62,6 +62,28 @@ HINTS: dict[str, tuple] = {
     "wakeword.whisper_model": (["tiny.en", "tiny", "base.en", "base"],
                                "Bigger is more accurate and uses more CPU."),
     "tools.code.root": (None, "The only folder the code tools may touch."),
+    "audio.barge_in": (None, "Talk over Toony to stop it mid-sentence."),
+    "audio.barge_in_sensitivity": ((1.0, 8.0),
+                                   "Raise this if it interrupts itself through "
+                                   "the speakers. Headphones need less."),
+    "audio.barge_in_ms": ((100, 1500),
+                          "How long you have to speak before it counts."),
+    "brain.parallel_tools": (None, "Run independent read-only tools at the same "
+                                   "time. Anything that asks first still waits."),
+    "tools.max_parallel": ((1, 12), ""),
+    "telegram.enabled": (None, "Message Toony from your phone. Set the token up "
+                               "with: toony telegram setup"),
+    "telegram.token": (None, "From @BotFather on Telegram."),
+    "telegram.allowed_chats": (None, "Only these chats may drive this machine. "
+                                     "Pair one with: toony telegram pair"),
+    "telegram.max_message_chars": ((100, 8000),
+                                   "A longer message is refused rather than "
+                                   "answered."),
+    "telegram.max_backlog": ((1, 200),
+                             "Messages that piled up while offline, past this "
+                             "many, get an apology instead of an answer."),
+    "telegram.speak_replies": (None, "Also say the answer out loud on the "
+                                     "laptop. Usually you are not there."),
     "audio.vad": (["energy", "webrtc"], "How the end of your sentence is detected."),
     "audio.silence_ms": ((200, 3000), "Silence that ends an utterance."),
     "audio.max_utterance_s": ((5, 120), ""),
@@ -78,7 +100,11 @@ HINTS: dict[str, tuple] = {
     "tools.sudo.enabled": (None, "Administrator access. Set it up with: "
                                  "toony sudo enable"),
     "ui.theme": (["auto", "dark", "light"], ""),
-    "ui.opacity": ((0.35, 1.0), "How see-through the window is."),
+    "ui.opacity": ((0.35, 1.0), "How see-through the window is. Under Wayland "
+                                "this tints the background rather than the "
+                                "window, because Wayland has no window opacity."),
+    "ui.frameless": (None, "Use Toony's own title bar. Turn it off for the "
+                           "normal KDE one if dragging misbehaves."),
     "ui.font_size": ((10, 22), ""),
     "general.reply_word_target": ((15, 200),
                                   "Spoken answers are kept near this length."),
@@ -95,10 +121,11 @@ GROUPS = [
     ("Brain", ["brain"]),
     ("Voice", ["stt", "tts", "audio", "wakeword", "ptt"]),
     ("Vision", ["vision"]),
+    ("Phone", ["telegram"]),
     ("Skills", ["tools", "memory"]),
 ]
 
-_SECRET = ("api_key",)
+_SECRET = ("api_key", "token", "pairing_code")
 
 
 class SettingsDialog(QDialog):

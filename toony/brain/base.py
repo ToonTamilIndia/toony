@@ -96,6 +96,15 @@ class BrainError(RuntimeError):
     """A backend could not answer — surfaced to the user as spoken text."""
 
 
+class InvalidRequest(BrainError):
+    """The backend rejected the transcript itself, not the request to answer.
+
+    Worth its own type because it is the one failure that repeats: the offending
+    message is in the stored conversation, so every later turn resends it and
+    fails the same way. The agent recovers by dropping the history.
+    """ 
+
+
 class Brain(abc.ABC):
     """One turn of conversation against some model provider."""
 

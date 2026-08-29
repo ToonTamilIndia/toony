@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
-from .brain.base import Brain, BrainError, Message, ToolSpec
+from .brain.base import Brain, BrainError, InvalidRequest, Message, ToolSpec
 from .brain.prompts import build as build_prompt
 from .history import Conversation, Store, store_for
 from .log import get
@@ -119,21 +120,45 @@ class Agent:
         system = self.system_prompt()
         tools = self.tools()
         max_iterations = int(self.config.get("brain.max_tool_iterations", 6))
+        stream_first = bool(self.config.get("brain.stream_from_start", True))
         started = time.monotonic()
+        first_token: float | None = None
         reply = None
+        self._salvaged = False
+
+        if on_text is not None:
+            inner = on_text
+
+            def on_text(chunk: str, _inner=inner) -> None:   # noqa: F811
+                nonlocal first_token
+                if first_token is None and chunk.strip():
+                    first_token = time.monotonic()
+                _inner(chunk)
 
         for iteration in range(max_iterations + 1):
             last_hop = iteration == max_iterations
             hop_tools = [] if last_hop else tools
             try:
-                # Only stream the hop that can produce the final answer; streaming
-                # a tool-call hop would speak text the user does not need.
+                # Stream from the very first hop. Waiting for a whole reply
+                # before speaking a word of it is thirty seconds of silence on a
+                # local model; any preamble before a tool call ("let me check")
+                # is worth hearing anyway.
                 window = self._window()
-                if on_text and iteration > 0:
+                if on_text and (iteration > 0 or stream_first):
                     reply = self.brain.stream_reply(system, window,
                                                     hop_tools, on_text)
                 else:
                     reply = self.brain.reply(system, window, hop_tools)
+            except InvalidRequest as exc:
+                # The stored transcript contains something this backend will
+                # not take. Retrying it unchanged fails forever — and it is
+                # stored, so every later turn fails too. Drop back to just the
+                # question and carry on.
+                if self._salvage(text, exc):
+                    continue
+                self.persist()
+                return ("Something in this conversation confused the model. "
+                        "I have started a fresh one — please ask again.")
             except BrainError as exc:
                 log.error("brain failed: %s", exc)
                 self.persist()
@@ -147,22 +172,90 @@ class Agent:
                     self.history.append(Message.user_text(_NUDGE))
                     continue
                 elapsed = time.monotonic() - started
-                log.info("answered in %.1fs after %d tool round(s)", elapsed, iteration)
+                if first_token is not None:
+                    log.info("answered in %.1fs (first word after %.1fs) "
+                             "after %d tool round(s)", elapsed,
+                             first_token - started, iteration)
+                else:
+                    log.info("answered in %.1fs after %d tool round(s)",
+                             elapsed, iteration)
                 if on_text and iteration == 0 and reply.text:
                     on_text(reply.text)
                 self.persist()
                 return reply.text
 
-            results = [self._run_tool(call) for call in reply.tool_calls]
+            results = self._run_tools(reply.tool_calls)
             self.history.append(Message.tool_results(results))
 
         self.persist()
         return (reply.text if reply else "") or "I got stuck working on that."
 
+    def _salvage(self, text: str, exc: Exception) -> bool:
+        """Reduce the transcript to the current question and try once more."""
+        if self._salvaged:
+            log.error("the model still rejects the request: %s", exc)
+            return False
+        self._salvaged = True
+        log.warning("the model rejected the transcript (%s) — starting a fresh "
+                    "conversation and retrying", exc)
+        self.persist()
+        self.start_new()
+        self.history.append(Message.user_text(text.strip()))
+        return True
+
     def _should_retry(self, text: str, iteration: int) -> bool:
         return (iteration == 0
                 and bool(self.config.get("brain.retry_refusals", True))
                 and looks_like_refusal(text))
+
+    # ---- running tools ----------------------------------------------------
+    def _run_tools(self, calls) -> list[tuple[str, str, bool]]:
+        """Run one round of tool calls, in parallel where that is safe.
+
+        A model asking "what is the volume, the battery and the time" should not
+        wait for three round trips through the desktop. But anything that has to
+        ask permission must stay serial — two spoken questions at once is not a
+        conversation — and so must anything that writes, because the model
+        cannot tell us whether two writes touch the same file.
+        """
+        if len(calls) < 2 or not self.config.get("brain.parallel_tools", True):
+            return [self._run_tool(call) for call in calls]
+
+        concurrent, serial = self._partition(calls)
+        if len(concurrent) < 2:
+            return [self._run_tool(call) for call in calls]
+
+        log.info("running %d tools in parallel, %d one at a time",
+                 len(concurrent), len(serial))
+        workers = max(1, min(int(self.config.get("tools.max_parallel", 4)),
+                             len(concurrent)))
+        done: dict[int, tuple[str, str, bool]] = {}
+        started = time.monotonic()
+        with ThreadPoolExecutor(max_workers=workers,
+                                thread_name_prefix="toony-tool") as pool:
+            futures = {pool.submit(self._run_tool, call): index
+                       for index, call in concurrent}
+            for future, index in futures.items():
+                done[index] = future.result()
+        log.info("parallel tools finished in %.1fs", time.monotonic() - started)
+
+        for index, call in serial:
+            done[index] = self._run_tool(call)
+        # The model matched each tool_use id to a position; keep that order.
+        return [done[index] for index in range(len(calls))]
+
+    def _partition(self, calls):
+        """Split calls into (can run together, must run alone), keeping indices."""
+        from .safety import decision_for
+
+        concurrent, serial = [], []
+        for index, call in enumerate(calls):
+            tool = REGISTRY.resolve(call.name, self.config)
+            parallel_safe = (tool is not None
+                             and tool.risk == "safe"
+                             and decision_for(self.config, tool) == "allow")
+            (concurrent if parallel_safe else serial).append((index, call))
+        return concurrent, serial
 
     def _run_tool(self, call) -> tuple[str, str, bool]:
         available = {t.name for t in REGISTRY.enabled(self.config)}

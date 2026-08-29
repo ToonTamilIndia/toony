@@ -38,6 +38,13 @@ DEFAULTS: dict[str, Any] = {
         # Small local models sometimes decline a perfectly ordinary request.
         # Retry once with a nudge before believing them.
         "retry_refusals": True,
+        # Run independent read-only tools at the same time. Anything that asks
+        # permission or writes still runs one at a time.
+        "parallel_tools": True,
+        # Speak from the first word rather than waiting for the whole reply.
+        # On a local model this is the difference between half a second and
+        # thirty seconds of silence.
+        "stream_from_start": True,
         "system_prompt": "",  # empty -> built-in prompt from brain/prompts.py
     },
     "brain.claude": {
@@ -133,6 +140,15 @@ DEFAULTS: dict[str, Any] = {
         "vad_aggressiveness": 2,            # webrtc only, 0-3
         "energy_threshold": 0.012,          # energy VAD, RMS in 0..1
         "start_chime": True,
+        # Talk over Toony to stop it. The threshold is deliberately above the
+        # ordinary one so the microphone does not trigger on the speakers;
+        # raise the sensitivity if it interrupts itself.
+        "barge_in": True,
+        "barge_in_ms": 300,                 # speech this long counts as cutting in
+        "barge_in_sensitivity": 2.5,        # multiples of energy_threshold
+        "barge_in_grace_ms": 600,           # ignore the first moment of speech
+        # After cutting in, start listening straight away.
+        "barge_in_starts_turn": True,
     },
     "wakeword": {
         "enabled": False,
@@ -162,6 +178,7 @@ DEFAULTS: dict[str, Any] = {
         "policy_sensitive": "ask",
         "policy_dangerous": "deny",
         "confirm_timeout_s": 20,
+        "max_parallel": 4,
         # Per-tool overrides, checked before the risk tiers above. Launching an
         # app is the classic case: "sensitive" by class, but you never want to
         # be asked twice about opening Firefox.
@@ -213,6 +230,24 @@ DEFAULTS: dict[str, Any] = {
         "enabled": True,
         "max_facts": 200,
     },
+    "telegram": {
+        # Talk to Toony from your phone. Set it up with: toony telegram setup
+        "enabled": False,
+        "token": "",                        # or use the env var below
+        "token_env": "TOONY_TELEGRAM_TOKEN",
+        # Only these chats may drive the machine. `toony telegram pair` prints
+        # a code; sending it to the bot adds that chat here.
+        "allowed_chats": [],
+        "pairing_code": "",
+        # A single message longer than this is refused rather than answered.
+        "max_message_chars": 4000,
+        # Messages that piled up while offline, past this many, get an apology
+        # instead of an answer.
+        "max_backlog": 20,
+        "poll_seconds": 25,
+        # Also say the answer out loud on the laptop. Usually you are not there.
+        "speak_replies": False,
+    },
     "conversation": {
         # Conversations survive restarts and are listed in the GUI.
         "persist": True,
@@ -232,6 +267,9 @@ DEFAULTS: dict[str, Any] = {
         "start_minimised": True,            # live in the tray until called
         "tray": True,
         "always_on_top": False,
+        # A custom title bar. Turn it off to get the normal KDE one, which is
+        # the fix if dragging the window ever refuses to work.
+        "frameless": True,
         "avatar_url": "https://avatars.githubusercontent.com/u/121746774?v=4",
         "autostart": True,
         # Show the window whenever a voice turn begins.
@@ -355,13 +393,17 @@ class Config:
         return out
 
     # ---- credentials ------------------------------------------------------
-    def api_key(self, section: str) -> str:
-        """Resolve a key: explicit value first, then the named env var."""
+    def api_key(self, section: str, field: str = "api_key") -> str:
+        """Resolve a secret: explicit value first, then the named env var.
+
+        ``field`` is the setting's name — "api_key" for a model backend,
+        "token" for Telegram — and its env override is always ``<field>_env``.
+        """
         sec = self.section(section)
-        key = str(sec.get("api_key") or "").strip()
+        key = str(sec.get(field) or "").strip()
         if key:
             return key
-        env = str(sec.get("api_key_env") or "").strip()
+        env = str(sec.get(f"{field}_env") or "").strip()
         return os.environ.get(env, "").strip() if env else ""
 
 

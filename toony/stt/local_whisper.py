@@ -13,6 +13,11 @@ log = get("stt.local")
 MODEL_SIZES = {"tiny": 0.4, "base": 0.6, "small": 1.2, "medium": 2.6,
                "large-v3": 4.7, "distil-large-v3": 2.5}
 
+# CTranslate2 loads CUDA lazily, so a model can build on the GPU and then fail
+# on the first encode. `cuda.preload()` loads the libraries pip put inside
+# site-packages, where the linker does not look, so LD_LIBRARY_PATH is not
+# needed — and cannot be lost when the systemd unit is rewritten.
+
 
 class LocalWhisper(STT):
     name = "local"
@@ -40,6 +45,10 @@ class LocalWhisper(STT):
             ) from exc
 
         device, compute = self._pick_device()
+        if device == "cuda":
+            from . import cuda
+
+            cuda.preload()
         log.info("loading whisper %s on %s (%s)", self.model_name, device, compute)
         started = time.monotonic()
         try:
@@ -58,13 +67,28 @@ class LocalWhisper(STT):
         return self._model
 
     def _pick_device(self) -> tuple[str, str]:
+        from . import cuda
+
         device = self.device
         if device == "auto":
-            device = "cuda" if _has_cuda() else "cpu"
+            device = "cuda" if (_has_cuda() and cuda.usable()) else "cpu"
         compute = self.compute_type
         if compute == "auto":
             compute = "float16" if device == "cuda" else "int8"
         return device, compute
+
+    def _fall_back_to_cpu(self, reason: str) -> None:
+        """Rebuild on the CPU. Slower is better than a turn that vanishes."""
+        from faster_whisper import WhisperModel
+
+        from . import cuda
+
+        log.error("GPU transcription failed: %s", reason)
+        log.error("%s", cuda.advice() or "falling back to the CPU")
+        self.device, self.compute_type = "cpu", "int8"
+        self._model = WhisperModel(self.model_name, device="cpu",
+                                   compute_type="int8")
+        log.info("whisper is now running on the CPU")
 
     def warm(self) -> None:
         self._load()
@@ -80,14 +104,15 @@ class LocalWhisper(STT):
             audio = _resample(audio, sample_rate, 16000)
 
         started = time.monotonic()
-        segments, info = model.transcribe(
-            audio, language=self.language, beam_size=self.beam_size,
-            initial_prompt=self.initial_prompt, vad_filter=True,
-            condition_on_previous_text=False)
-        parts, probabilities = [], []
-        for segment in segments:
-            parts.append(segment.text)
-            probabilities.append(getattr(segment, "avg_logprob", 0.0))
+        try:
+            parts, probabilities, info = self._run(model, audio)
+        except RuntimeError as exc:
+            # CTranslate2 only touches cuBLAS on the first encode, so a broken
+            # CUDA install surfaces here rather than at load time.
+            if self.device != "cuda" or not _is_missing_library(exc):
+                raise STTError(f"transcription failed: {exc}") from exc
+            self._fall_back_to_cpu(str(exc))
+            parts, probabilities, info = self._run(self._model, audio)
         text = " ".join(p.strip() for p in parts).strip()
         log.info("transcribed %.1fs of audio in %.2fs: %r",
                  len(audio) / 16000, time.monotonic() - started, text[:80])
@@ -99,13 +124,46 @@ class LocalWhisper(STT):
         return Transcript(text=text, language=getattr(info, "language", "") or "",
                           duration_s=len(audio) / 16000, confidence=confidence)
 
+    def _run(self, model, audio):
+        segments, info = model.transcribe(
+            audio, language=self.language, beam_size=self.beam_size,
+            initial_prompt=self.initial_prompt, vad_filter=True,
+            condition_on_previous_text=False)
+        parts, probabilities = [], []
+        for segment in segments:          # lazy: this is where CUDA actually runs
+            parts.append(segment.text)
+            probabilities.append(getattr(segment, "avg_logprob", 0.0))
+        return parts, probabilities, info
+
     def check(self) -> str:
         device, compute = self._pick_device()
         try:
             import faster_whisper  # noqa: F401
         except ImportError:
             return "faster-whisper is not installed"
-        return f"faster-whisper ready, model {self.model_name} on {device} ({compute})"
+        from . import cuda
+
+        note = ""
+        if device == "cuda":
+            absent = cuda.missing()
+            if absent:
+                note = f" — but {', '.join(absent)} cannot be loaded"
+        elif self.device == "cuda":
+            note = " (asked for cuda, using the CPU)"
+        return (f"faster-whisper ready, model {self.model_name} "
+                f"on {device} ({compute}){note}")
+
+
+def _is_missing_library(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "not found or cannot be loaded" in text or "libcu" in text
+
+
+def missing_cuda_libraries() -> list[str]:
+    """Which CUDA libraries CTranslate2 will fail on. Empty means it will work."""
+    from . import cuda
+
+    return cuda.missing()
 
 
 def _has_cuda() -> bool:

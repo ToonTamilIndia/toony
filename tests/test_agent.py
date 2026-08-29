@@ -110,6 +110,101 @@ class TestAgentLoop(unittest.TestCase):
         self.assertEqual(len(agent.history), 10)
 
 
+class TestRejectedTranscript(unittest.TestCase):
+    """Ollama rejects `content: null`, and the transcript is stored, so a single
+    bad turn otherwise breaks every turn after it — for ever."""
+
+    class Fussy(Brain):
+        def __init__(self):
+            self.sizes = []
+
+        def reply(self, system, messages, tools):
+            from toony.brain.base import InvalidRequest
+
+            self.sizes.append(len(messages))
+            if any(b.get("type") == "tool_use"
+                   for m in messages for b in m.content):
+                raise InvalidRequest("invalid message content type: <nil>")
+            return BrainReply(text="That worked.")
+
+    def _poisoned(self, agent):
+        agent.history.extend([
+            Message.user_text("an earlier turn"),
+            Message.assistant("", [ToolCall("c1", "get_datetime", {})]),
+        ])
+
+    def test_a_poisoned_conversation_heals_itself(self):
+        brain = self.Fussy()
+        agent = Agent(make_config(), brain)
+        self._poisoned(agent)
+        self.assertEqual(agent.ask("what time is it"), "That worked.")
+        self.assertEqual(brain.sizes, [3, 1])   # tried, then dropped the history
+
+    def test_the_question_survives_the_reset(self):
+        agent = Agent(make_config(), self.Fussy())
+        self._poisoned(agent)
+        agent.ask("what time is it")
+        self.assertEqual(agent.history[0].text(), "what time is it")
+
+    def test_it_gives_up_rather_than_looping(self):
+        class AlwaysRejects(Brain):
+            def __init__(self):
+                self.calls = 0
+
+            def reply(self, system, messages, tools):
+                from toony.brain.base import InvalidRequest
+
+                self.calls += 1
+                raise InvalidRequest("nope")
+
+        brain = AlwaysRejects()
+        reply = Agent(make_config(), brain).ask("hello")
+        self.assertEqual(brain.calls, 2)        # one retry, then it stops
+        self.assertIn("fresh one", reply)
+
+    def test_an_ordinary_failure_is_not_retried(self):
+        class Broken(Brain):
+            def __init__(self):
+                self.calls = 0
+
+            def reply(self, system, messages, tools):
+                self.calls += 1
+                raise BrainError("I could not reach the model.")
+
+        brain = Broken()
+        Agent(make_config(), brain).ask("hello")
+        self.assertEqual(brain.calls, 1)
+
+
+class TestOpenAIConversion(unittest.TestCase):
+    def _convert(self, messages):
+        from toony.brain.openai_compat import OpenAICompatBrain
+
+        return OpenAICompatBrain._convert(messages)
+
+    def test_content_is_never_null(self):
+        """`content: null` is legal OpenAI and a 400 from Ollama."""
+        converted = self._convert([
+            Message.user_text("what time is it"),
+            Message.assistant("", [ToolCall("c1", "get_datetime", {})]),
+            Message.tool_results([("c1", "", False)]),
+            Message.assistant("It is noon."),
+        ])
+        for entry in converted:
+            with self.subTest(role=entry["role"]):
+                self.assertIsNotNone(entry["content"])
+
+    def test_a_tool_call_without_text_keeps_its_call(self):
+        entry = self._convert(
+            [Message.assistant("", [ToolCall("c1", "get_volume", {})])])[0]
+        self.assertEqual(entry["content"], "")
+        self.assertEqual(entry["tool_calls"][0]["function"]["name"], "get_volume")
+
+    def test_an_empty_tool_result_says_so(self):
+        entry = self._convert([Message.tool_results([("c1", "", False)])])[0]
+        self.assertIn("nothing", entry["content"])
+
+
 class TestSafety(unittest.TestCase):
     def setUp(self):
         # write_clipboard is "sensitive" and not on the shipped always_allow

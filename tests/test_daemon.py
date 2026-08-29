@@ -67,6 +67,9 @@ def build_assistant(replies=None, store=None):
     assistant._stop_listening = threading.Event()
     assistant._turn_lock = threading.Lock()
     assistant._pending = {}
+    assistant._interrupted = False
+    assistant.telegram = None
+    assistant._chat_conversations = {}
     assistant._server = ipc.ControlServer(assistant._handle)
     return assistant
 
@@ -244,6 +247,36 @@ class TestEventStream(unittest.TestCase):
         allowed = self.assistant._confirm("Can I open the door?")
         self.assertTrue(allowed)
         self.assertEqual(answers.get(timeout=2), "Can I open the door?")
+
+    def test_the_activation_token_reaches_the_window(self):
+        """Wayland refuses a client's own focus request; only a token gets in."""
+        events = self._collect()
+        ipc.send("listen", activation_token="kwin-token-abc", timeout=5)
+
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            try:
+                event = events.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if event.get("event") == "listen_requested":
+                self.assertEqual(event["activation_token"], "kwin-token-abc")
+                return
+        self.fail("no listen_requested event arrived")
+
+    def test_a_hotkey_press_without_a_token_still_works(self):
+        events = self._collect()
+        self.assertTrue(ipc.send("listen", timeout=5)["ok"])
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            try:
+                event = events.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if event.get("event") == "listen_requested":
+                self.assertEqual(event["activation_token"], "")
+                return
+        self.fail("no listen_requested event arrived")
 
     def test_no_window_answer_falls_back_rather_than_hanging(self):
         self._collect()

@@ -12,6 +12,7 @@ import time
 import uuid
 
 from .agent import Agent
+from .audio.bargein import build as build_bargein
 from .audio.capture import AudioUnavailable, Microphone
 from .audio.playback import Player
 from .brain import build_brain
@@ -59,6 +60,11 @@ class Assistant:
         self._stop_listening = threading.Event()
         self._turn_lock = threading.Lock()
         self._audio_thread: threading.Thread | None = None
+        self._interrupted = False
+        self.telegram = None
+        # One conversation per chat, so your phone and your voice do not
+        # interleave into a single confusing transcript.
+        self._chat_conversations: dict[str, str] = {}
         # Permission questions waiting on an answer from the GUI.
         self._pending: dict[str, queue.Queue] = {}
 
@@ -93,6 +99,7 @@ class Assistant:
     def start(self) -> None:
         self._running.set()
         self._server.start()
+        self._start_telegram()
         self._warm()
         self._audio_thread = threading.Thread(target=self._audio_loop,
                                               name="toony-audio", daemon=True)
@@ -142,12 +149,63 @@ class Assistant:
 
     def stop(self) -> None:
         self._running.clear()
+        if self.telegram is not None:
+            self.telegram.stop()
         self.agent.persist()   # never lose the last thing that was said
         self.voice.stop()
         if self.wakeword is not None:
             self.wakeword.stop()
         self._server.stop()
         log.info("stopped after %d turns", self.turns)
+
+    # ---- telegram ---------------------------------------------------------
+    def _start_telegram(self) -> None:
+        if not self.config.get("telegram.enabled", False):
+            return
+        from .bridges.telegram import TelegramBridge, TelegramError
+
+        try:
+            self.telegram = TelegramBridge(self.config, self._answer_remotely,
+                                           publish=self.publish)
+            self.telegram.start()
+        except TelegramError as exc:
+            self.last_error = str(exc)
+            log.error("telegram bridge not started: %s", exc)
+            self.telegram = None
+
+    def _answer_remotely(self, text: str, meta: dict) -> str:
+        """One message from a bridge. Same agent, its own conversation."""
+        chat = str(meta.get("chat", ""))
+        with self._turn_lock:
+            previous = self.agent.conversation.id
+            self._enter_chat(chat, meta)
+            if meta.get("new"):
+                self.agent.start_new(f"Telegram · {meta.get('who', chat)}")
+                self._chat_conversations[chat] = self.agent.conversation.id
+                self.agent.persist()
+                return ""
+            self.turns += 1
+            self.state = "thinking"
+            try:
+                reply = self._run_agent(text)
+            finally:
+                self._chat_conversations[chat] = self.agent.conversation.id
+                self.state = "idle"
+                if previous != self.agent.conversation.id:
+                    self.agent.persist()
+                    self.agent.open(previous)
+
+        if reply and self.config.get("telegram.speak_replies", False):
+            threading.Thread(target=self.say, args=(reply,), daemon=True).start()
+        return reply
+
+    def _enter_chat(self, chat: str, meta: dict) -> None:
+        self.agent.persist()
+        known = self._chat_conversations.get(chat)
+        if known and self.agent.open(known) is not None:
+            return
+        self.agent.start_new(f"Telegram · {meta.get('who', chat)}")
+        self._chat_conversations[chat] = self.agent.conversation.id
 
     # ---- the microphone thread -------------------------------------------
     def _audio_loop(self) -> None:
@@ -219,14 +277,43 @@ class Assistant:
             return
 
         stream = self.voice.open_stream()
+        listener = self._listen_for_interruption()
         try:
-            reply = self._run_agent(text, on_text=stream.feed)
+            reply = self._run_agent(text, on_text=self._streaming(stream))
         finally:
             self.state = "speaking"
             stream.close()
+            if listener is not None:
+                listener.stop()
         # Backends that cannot stream return everything at the end instead.
-        if reply and not stream.spoke:
+        if reply and not stream.spoke and not self._interrupted:
             self.say(reply)
+
+    def _streaming(self, stream):
+        """Feed the voice and every open window from the same token stream."""
+        def on_text(chunk: str) -> None:
+            stream.feed(chunk)
+            if chunk:
+                self.publish("reply_chunk", text=chunk,
+                             conversation=self.agent.conversation.id)
+        return on_text
+
+    # ---- being talked over ------------------------------------------------
+    def _listen_for_interruption(self):
+        """Watch for the user cutting in, for as long as Toony is talking."""
+        self._interrupted = False
+        listener = build_bargein(self.config, self._on_barge_in)
+        if listener is not None:
+            listener.start()
+        return listener
+
+    def _on_barge_in(self) -> None:
+        self._interrupted = True
+        self.voice.stop()
+        self.publish("interrupted", by="voice")
+        if self.config.get("audio.barge_in_starts_turn", True):
+            # They talked over it because they had something to say. Listen.
+            self._turn_requested.set()
 
     def _run_agent(self, text: str, on_text=None) -> str:
         try:
@@ -240,17 +327,20 @@ class Assistant:
                      title=self.agent.conversation.display_title())
         return reply
 
-    def say(self, text: str) -> None:
+    def say(self, text: str, interruptible: bool = True) -> None:
         """Speak a message. Blocks until it is finished or interrupted."""
         if not text.strip():
             return
         previous, self.state = self.state, "speaking"
+        listener = self._listen_for_interruption() if interruptible else None
         try:
             self.voice.say(text)
         except TTSError as exc:
             self.last_error = str(exc)
             log.error("speech failed: %s", exc)
         finally:
+            if listener is not None:
+                listener.stop()
             self.state = previous if previous != "speaking" else "idle"
 
     # ---- confirmation for "ask" policies ---------------------------------
@@ -274,6 +364,10 @@ class Assistant:
         self._pending[request_id] = inbox
         timeout = float(self.config.get("tools.confirm_timeout_s", 20))
         try:
+            # No token here — this starts inside the daemon, which has no
+            # focus to derive one from. The window will show itself but may
+            # stay behind whatever you are working in, so it also asks the
+            # notification service to get your attention, which always works.
             self.publish("confirm", id=request_id, question=question,
                          timeout=timeout)
             try:
@@ -286,12 +380,16 @@ class Assistant:
 
     def _confirm_by_voice(self, question: str) -> bool:
         """Ask out loud, then listen for a yes or a no."""
-        self.say(question)
+        self.say(question, interruptible=False)
         try:
             with Microphone(self.config) as mic:
-                pcm = mic.record_utterance(wait_for_speech=True)
+                # A yes or a no, not a monologue: give up quickly if nothing
+                # comes rather than recording for the full utterance length.
+                pcm = mic.record_utterance(wait_for_speech=True, max_seconds=6.0,
+                                           lead_in_s=5.0)
                 if not pcm:
-                    log.info("no answer to the confirmation prompt")
+                    log.info("no answer to the confirmation prompt — treating "
+                             "silence as no")
                     return False
                 answer = self.stt.transcribe(pcm, mic.sample_rate).text
         except (AudioUnavailable, STTError) as exc:
@@ -326,6 +424,8 @@ class Assistant:
                 "conversation": self.agent.conversation.id,
                 "conversation_title": self.agent.conversation.display_title(),
                 "windows": self._server.subscribers if self._server else 0,
+                "telegram": (self.telegram.status() if self.telegram
+                             else {"running": False}),
                 "sudo": bool(self.config.get("tools.sudo.enabled", False)),
                 "tools": len(self.agent.tools()),
                 "last_error": self.last_error}
@@ -345,7 +445,10 @@ class Assistant:
             self._stop_listening.set()
             return {"ok": True, "action": "stopped listening"}
         self._turn_requested.set()
-        self.publish("listen_requested")
+        # Hand the compositor's activation token straight through: it is
+        # short-lived and single-use, and only a window can spend it.
+        self.publish("listen_requested",
+                     activation_token=str(request.get("activation_token", "")))
         return {"ok": True, "action": "listening"}
 
     def _cmd_cancel(self, request: dict) -> dict:
@@ -519,8 +622,39 @@ class Assistant:
         if self.wakeword is not None:
             self.wakeword.stop()
         self.wakeword = self._build_wakeword(fresh)
+
+        if fresh.section("telegram") != previous.section("telegram"):
+            if self.telegram is not None:
+                self.telegram.stop()
+                self.telegram = None
+            self._start_telegram()
+
         self._warm()
         return {"ok": True, "action": "reloaded"}
+
+    def _cmd_telegram(self, request: dict) -> dict:
+        """Start, stop or report the phone bridge without restarting anything."""
+        action = str(request.get("action", "status"))
+        if action == "status":
+            return {"ok": True, "telegram": (self.telegram.status()
+                                             if self.telegram
+                                             else {"running": False})}
+        if action == "stop":
+            if self.telegram is not None:
+                self.telegram.stop()
+                self.telegram = None
+            return {"ok": True, "action": "stopped"}
+        if action == "start":
+            self.config = Config.load()
+            self.agent.config = self.config
+            if self.telegram is not None:
+                self.telegram.stop()
+                self.telegram = None
+            self._start_telegram()
+            if self.telegram is None:
+                return {"ok": False, "error": self.last_error or "could not start"}
+            return {"ok": True, "action": "started"}
+        return {"ok": False, "error": f"unknown action {action!r}"}
 
     def _cmd_quit(self, request: dict) -> dict:
         threading.Thread(target=self._delayed_stop, daemon=True).start()

@@ -56,10 +56,32 @@ def palette(mode: str, accent: str = "#7c5cff") -> dict[str, str]:
     return colours
 
 
-def stylesheet(mode: str, accent: str = "#7c5cff", font_size: int = 14) -> str:
+def rgba(colour: str, alpha: float) -> str:
+    """#rrggbb plus an alpha, as CSS. Qt stylesheets understand rgba()."""
+    text = colour.lstrip("#")
+    if len(text) == 3:
+        text = "".join(c * 2 for c in text)
+    try:
+        red, green, blue = (int(text[i:i + 2], 16) for i in (0, 2, 4))
+    except (ValueError, IndexError):
+        return colour
+    return f"rgba({red}, {green}, {blue}, {min(1.0, max(0.0, alpha)):.3f})"
+
+
+def stylesheet(mode: str, accent: str = "#7c5cff", font_size: int = 14,
+               opacity: float = 1.0) -> str:
+    """The sheet, with the window's translucency baked into its backgrounds.
+
+    Wayland has no per-window opacity — `setWindowOpacity` is silently ignored —
+    so the only way to be see-through there is to paint translucent colours.
+    Doing it here works on every platform.
+    """
     c = palette(mode, accent)
     c["font_size"] = str(font_size)
     c["small"] = str(max(10, font_size - 2))
+    if opacity < 0.999:
+        for key in ("bg", "panel", "raised"):
+            c[key] = rgba(c[key], opacity)
     return _SHEET.format(**c)
 
 

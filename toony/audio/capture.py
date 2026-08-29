@@ -94,16 +94,25 @@ class Microphone:
 
     # ---- the important one ------------------------------------------------
     def record_utterance(self, stop_event: threading.Event | None = None,
-                         wait_for_speech: bool = True) -> bytes | None:
-        """Record one utterance as 16-bit PCM. None if nothing was said."""
+                         wait_for_speech: bool = True,
+                         max_seconds: float | None = None,
+                         lead_in_s: float = 4.0) -> bytes | None:
+        """Record one utterance as 16-bit PCM. None if nothing was said.
+
+        ``max_seconds`` overrides the configured ceiling. A yes/no answer needs
+        a few seconds, not thirty — waiting the full length for a word that
+        never comes is half a minute of the user wondering what happened.
+        """
         config = self.config
         per_second = 1000 / self.frame_ms
         silence_frames = max(1, int(int(config.get("audio.silence_ms", 800))
                                     / self.frame_ms))
         min_frames = max(1, int(int(config.get("audio.min_utterance_ms", 350))
                                 / self.frame_ms))
-        max_frames = int(float(config.get("audio.max_utterance_s", 30)) * per_second)
-        lead_in_frames = int(4 * per_second)  # how long to wait for a first word
+        ceiling = (max_seconds if max_seconds is not None
+                   else float(config.get("audio.max_utterance_s", 30)))
+        max_frames = int(ceiling * per_second)
+        lead_in_frames = int(lead_in_s * per_second)
 
         collected: list[bytes] = []
         quiet = waited = 0

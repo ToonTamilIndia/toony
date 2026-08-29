@@ -17,8 +17,14 @@ def run(start_hidden: bool | None = None) -> int:
 def available() -> bool:
     """True if PySide6 is importable, without importing the whole GUI."""
     import importlib.util
+    import sys
 
-    return importlib.util.find_spec("PySide6") is not None
+    if "PySide6" in sys.modules:
+        return True
+    try:
+        return importlib.util.find_spec("PySide6") is not None
+    except (ImportError, ValueError):
+        return False
 
 
 __all__ = ["run", "available"]

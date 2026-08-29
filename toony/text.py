@@ -60,7 +60,7 @@ _NOUN = re.compile(r"\s+(?:folder|directory|dir|file|script)$", re.IGNORECASE)
 
 
 def _strip_words(text: str) -> str:
-    """Drop the article, the noun, and the sentence's own full stop.
+    r"""Drop the article, the noun, and the sentence's own full stop.
 
     `[\w.@+-]` has to allow dots for extensions, so a path at the end of a
     sentence arrives as "app.py." and stops looking like a Python file.

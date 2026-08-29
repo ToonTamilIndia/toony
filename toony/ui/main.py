@@ -57,11 +57,20 @@ class SingleInstance:
         return True
 
     def _ring(self) -> bool:
+        """Tell the running window to show itself, and lend it our token.
+
+        This process was launched by the desktop, so the compositor handed it
+        an xdg-activation token. The window already running has none — under
+        Wayland it cannot focus itself — so passing ours across is the only
+        way a second click on the launcher actually brings it forward.
+        """
+        token = (os.environ.get("XDG_ACTIVATION_TOKEN", "")
+                 or os.environ.get("DESKTOP_STARTUP_ID", ""))
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
                 sock.settimeout(1.0)
                 sock.connect(str(self.path))
-                sock.sendall(b"show\n")
+                sock.sendall(f"show {token}\n".encode("utf-8", "replace"))
                 return True
         except OSError:
             return False
@@ -72,18 +81,37 @@ class SingleInstance:
                 conn, _ = self._sock.accept()
             except (socket.timeout, OSError):
                 continue
+            token = ""
             with conn:
                 try:
-                    conn.recv(16)
+                    conn.settimeout(1.0)
+                    raw = conn.recv(4096).decode("utf-8", "replace").strip()
+                    parts = raw.split(" ", 1)
+                    token = parts[1].strip() if len(parts) > 1 else ""
                 except OSError:
                     pass
-            self.on_show()
+            self.on_show(token)
 
     def release(self) -> None:
         self._running = False
         if self._sock:
             self._sock.close()
         self.path.unlink(missing_ok=True)
+
+
+def _notify_send(message: str) -> bool:
+    """A desktop notification without Qt, for when there is no tray icon."""
+    import shutil
+    import subprocess
+
+    if not shutil.which("notify-send"):
+        return False
+    try:
+        subprocess.Popen(["notify-send", "--app-name=Toony", "--icon=toony",
+                          "Toony", message], start_new_session=True)
+        return True
+    except OSError:
+        return False
 
 
 def run(start_hidden: bool | None = None) -> int:
@@ -119,6 +147,11 @@ def run(start_hidden: bool | None = None) -> int:
     client = DaemonClient()
     window = ToonyWindow(config, client)
     window.setWindowIcon(icon)
+
+    # A second `toony gui` is launched by the desktop, so it is handed an
+    # activation token; the running window spends it to come forward.
+    def show_with(token: str = "") -> None:
+        window.pop_up(token)
 
     # ---- settings ---------------------------------------------------------
     def open_settings() -> None:
@@ -178,10 +211,15 @@ def run(start_hidden: bool | None = None) -> int:
         menu.setStyleSheet(window.styleSheet())
 
     def notify(message: str) -> None:
+        """The one way to reach the user that Wayland never refuses."""
         if tray is not None:
-            tray.showMessage("Toony", message, icon, 5000)
-        else:
-            log.info(message)
+            tray.showMessage("Toony", message, icon, 8000)
+            return
+        if _notify_send(message):
+            return
+        log.info(message)
+
+    window.on_attention = notify
 
     def on_connected(online: bool) -> None:
         if tray is not None:
@@ -190,7 +228,8 @@ def run(start_hidden: bool | None = None) -> int:
     client.connected.connect(on_connected)
 
     # ---- single instance --------------------------------------------------
-    lock = SingleInstance(on_show=lambda: QTimer.singleShot(0, window.pop_up))
+    lock = SingleInstance(
+        on_show=lambda token: QTimer.singleShot(0, lambda: show_with(token)))
     if not lock.claim():
         print("Toony's window is already open.")
         return 0

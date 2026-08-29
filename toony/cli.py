@@ -55,10 +55,24 @@ def _offline(reply: dict) -> bool:
     return "not running" in error or "stale" in error
 
 
+def activation_token() -> str:
+    """The compositor's permission to raise a window, if we were given one.
+
+    Under Wayland a client cannot focus itself — `activateWindow()` is silently
+    ignored. The only way in is xdg-activation: whoever currently has focus
+    asks the compositor for a token and hands it over. Toony's hotkey is run by
+    the compositor itself, so *this* process is handed one in its environment.
+    Passing it to the daemon is what lets the window actually come forward.
+    """
+    return (os.environ.get("XDG_ACTIVATION_TOKEN", "")
+            or os.environ.get("DESKTOP_STARTUP_ID", ""))
+
+
 def cmd_listen(args) -> int:
     from . import ipc
 
-    reply = ipc.send("listen", edge=args.edge, timeout=10)
+    reply = ipc.send("listen", edge=args.edge, timeout=10,
+                     activation_token=activation_token())
     if reply.get("ok"):
         print(reply.get("action", "ok"))
         return 0
@@ -423,6 +437,17 @@ def cmd_doctor(args) -> int:
     except Exception as exc:
         check("input devices", False, str(exc))
 
+    if config.get("stt.provider") == "local":
+        from .stt.cuda import missing as missing_cuda
+
+        wanted = str(config.get("stt.local.device", "auto"))
+        absent = missing_cuda()
+        if wanted != "cpu":
+            check("CUDA libraries", not absent,
+                  "loaded" if not absent
+                  else f"{', '.join(absent)} missing — speech will run on the CPU",
+                  fatal=False)
+
     print(bold("\nbackends"))
     from .brain import vision_summary
 
@@ -614,6 +639,9 @@ RestartSec=3
 # Give the model time to load before systemd decides it hung.
 TimeoutStartSec=120
 Slice=session.slice
+{environment}
+# Anything you add in toony.service.d/override.conf survives `toony install`.
+# This file does not: it is rewritten every time.
 
 [Install]
 WantedBy=graphical-session.target default.target
@@ -670,6 +698,30 @@ def _unit_path():
 
     base = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
     return Path(base) / "systemd" / "user" / "toony.service"
+
+
+def _override_path():
+    """A drop-in `toony install` never overwrites, for your own additions."""
+    return _unit_path().parent / "toony.service.d" / "override.conf"
+
+
+def _unit_environment() -> str:
+    """Environment lines the service needs, worked out at install time.
+
+    The CUDA libraries pip installs live inside site-packages, which the dynamic
+    linker does not search. Toony loads them itself at runtime, but putting the
+    path here as well means anything it shells out to finds them too.
+    """
+    lines = []
+    try:
+        from .stt.cuda import library_path
+
+        path = library_path()
+        if path:
+            lines.append(f"Environment=LD_LIBRARY_PATH={path}")
+    except Exception:
+        pass
+    return "\n".join(lines)
 
 
 def _desktop_path():
@@ -744,9 +796,30 @@ def cmd_install(args) -> int:
 
     unit = _unit_path()
     unit.parent.mkdir(parents=True, exist_ok=True)
-    unit.write_text(SERVICE_UNIT.format(display=DISPLAY_NAME, executable=executable),
+    environment = _unit_environment()
+    unit.write_text(SERVICE_UNIT.format(display=DISPLAY_NAME,
+                                        executable=executable,
+                                        environment=environment),
                     encoding="utf-8")
     print(f"wrote {unit}")
+    if environment:
+        print(dim(f"  with {environment.count('Environment=')} environment "
+                  f"line(s) for the CUDA libraries"))
+
+    override = _override_path()
+    if not override.exists():
+        override.parent.mkdir(parents=True, exist_ok=True)
+        override.write_text(
+            "# Your own settings for the Toony service.\n"
+            "# `toony install` rewrites toony.service but never touches this\n"
+            "# file, so anything you put here survives an upgrade.\n"
+            "#\n"
+            "# [Service]\n"
+            "# Environment=LD_LIBRARY_PATH=/opt/cuda/lib64\n"
+            "# Environment=OLLAMA_HOST=127.0.0.1:11434\n", encoding="utf-8")
+        print(f"wrote {override}  {dim('(yours to edit; never overwritten)')}")
+    else:
+        print(dim(f"kept {override}"))
 
     for path, template in ((_desktop_path(), DESKTOP_ENTRY),
                            (_gui_desktop_path(), GUI_ENTRY)):
@@ -992,8 +1065,8 @@ def _shortcut_status(shortcut: str) -> int:
 def cmd_uninstall(args) -> int:
     if shutil.which("systemctl"):
         subprocess.call(["systemctl", "--user", "disable", "--now", "toony.service"])
-    for path in (_unit_path(), _desktop_path(), _gui_desktop_path(),
-                 _autostart_path(), _icon_path()):
+    for path in (_unit_path(), _override_path(), _desktop_path(),
+                 _gui_desktop_path(), _autostart_path(), _icon_path()):
         if path.exists():
             path.unlink()
             print(f"removed {path}")
@@ -1008,6 +1081,338 @@ def cmd_uninstall(args) -> int:
         subprocess.call(["systemctl", "--user", "daemon-reload"])
     print(dim(f"Configuration in {CONFIG_FILE.parent} was left alone."))
     return 0
+
+
+# --------------------------------------------------------------- first run
+def cmd_setup(args) -> int:
+    """One pass through every choice that matters, in plain language."""
+    config = Config.load()
+    print(bold(f"\n{DISPLAY_NAME} setup\n"))
+    print(dim("  Enter accepts the suggestion in brackets. Ctrl-C stops.\n"))
+
+    try:
+        _setup_brain(config)
+        _setup_voice(config)
+        _setup_wakeword(config)
+        _setup_personality(config)
+        _setup_extras(config)
+        config.save()
+    except (EOFError, KeyboardInterrupt):
+        print(dim("\n  stopped — nothing was saved beyond this point"))
+        return 1
+
+    print()
+    if _yes("Install the background service and the Meta+Space hotkey?"):
+        args.no_start = args.no_shortcut = args.no_autostart = False
+        cmd_install(args)
+
+    if _yes("Set up the Telegram bot so you can message it from your phone?",
+            default=False):
+        _telegram_setup(Config.load())
+
+    print()
+    print(ok("Done."))
+    print(dim("  toony doctor        check everything is in place"))
+    print(dim("  toony gui           open the window"))
+    print(dim("  Meta+Space          talk to it"))
+    return 0
+
+
+def _choose(question: str, options: list[tuple[str, str]], default: str) -> str:
+    print(f"\n{bold(question)}")
+    for value, description in options:
+        marker = ok(" ←") if value == default else ""
+        print(f"  {value:10} {dim(description)}{marker}")
+    answer = input(f"  choice [{default}]: ").strip().lower()
+    valid = {value for value, _ in options}
+    while answer and answer not in valid:
+        answer = input(f"  pick one of {', '.join(sorted(valid))} "
+                       f"[{default}]: ").strip().lower()
+    return answer or default
+
+
+def _setup_brain(config) -> None:
+    choice = _choose("Which model should answer you?", [
+        ("local", "Ollama on this laptop. No key, no network, nothing leaves."),
+        ("cloud", "Claude. Much better answers; needs an API key."),
+    ], "local")
+    if choice == "local":
+        config.set("brain.provider", "ollama", save=False)
+        print(dim("  Make sure Ollama is running: ollama serve"))
+        print(dim(f"  and that you have the model: ollama pull "
+                  f"{config.get('brain.ollama.model')}"))
+        return
+    config.set("brain.provider", "claude", save=False)
+    if not config.api_key("brain.claude"):
+        key = input("  Anthropic API key (Enter to use $ANTHROPIC_API_KEY): ").strip()
+        if key:
+            config.set("brain.claude.api_key", key, save=False)
+        else:
+            print(dim("  Fine — export ANTHROPIC_API_KEY before starting Toony."))
+
+
+def _setup_voice(config) -> None:
+    choice = _choose("Where should speech be processed?", [
+        ("local", "Whisper and Piper on your GPU. Private, and free."),
+        ("cloud", "OpenAI. Slightly better, costs per minute."),
+    ], "local")
+    if choice == "local":
+        config.set("stt.provider", "local", save=False)
+        config.set("tts.provider", "piper", save=False)
+    else:
+        config.set("stt.provider", "openai", save=False)
+        config.set("tts.provider", "openai", save=False)
+
+
+def _setup_wakeword(config) -> None:
+    from .audio.wakeword import suggest_engine
+
+    if not _yes("\nWake it by saying a phrase, as well as by hotkey?",
+                default=False):
+        config.set("wakeword.enabled", False, save=False)
+        return
+    phrase = input('  phrase [hey toony]: ').strip() or "hey toony"
+    engine = suggest_engine(phrase)
+    config.set("wakeword.enabled", True, save=False)
+    config.set("wakeword.engine", engine, save=False)
+    if engine == "whisper":
+        config.set("wakeword.phrase", phrase, save=False)
+    else:
+        config.set("wakeword.model", phrase.lower().replace(" ", "_"), save=False)
+    print(dim(f"  Using the {engine} engine for {phrase!r}."))
+
+
+def _setup_personality(config) -> None:
+    choice = _choose("How should it talk to you?", [
+        ("plain", "Answers, nothing else."),
+        ("friendly", "Warm and quick, the odd joke."),
+        ("spicy", "Funny and sarcastic. Still answers first."),
+    ], "friendly")
+    config.set("general.personality", choice, save=False)
+
+
+def _setup_extras(config) -> None:
+    if _yes("\nWill you use it to help with code?", default=False):
+        config.set("general.focus", "coding", save=False)
+        root = input(f"  where your projects live "
+                     f"[{config.get('tools.code.root')}]: ").strip()
+        if root:
+            config.set("tools.code.root", root, save=False)
+    if _yes("Let it stop talking when you talk over it?"):
+        config.set("audio.barge_in", True, save=False)
+    else:
+        config.set("audio.barge_in", False, save=False)
+
+
+# ------------------------------------------------------------------ telegram
+_BOTFATHER = """\
+To make a bot, on Telegram:
+
+  1. open a chat with @BotFather
+  2. send /newbot
+  3. give it any name, then a username ending in "bot"
+  4. it replies with a token that looks like 123456789:AAF...
+
+Paste that token here."""
+
+
+def cmd_telegram(args) -> int:
+    import secrets
+
+    from .bridges.telegram import (TelegramError, describe_bot, online)
+
+    config = Config.load()
+    action = args.action or "status"
+
+    if action == "status":
+        return _telegram_status(config)
+
+    if action == "off":
+        config.set("telegram.enabled", False)
+        _telegram_daemon("stop")
+        print(ok("the Telegram bridge is off"))
+        return 0
+
+    if action == "pair":
+        code = str(config.get("telegram.pairing_code", "") or "")
+        if not code or args.new_code:
+            code = secrets.token_hex(3).upper()
+            config.set("telegram.pairing_code", code)
+        print(f"{bold('pairing code')}  {ok(code)}")
+        print(dim("\n  Send exactly that to your bot on Telegram. The chat it "
+                  "comes from\n  is then allowed to drive this machine. "
+                  "Nothing else is."))
+        allowed = config.get("telegram.allowed_chats", [])
+        if allowed:
+            print(dim(f"\n  already paired: {', '.join(map(str, allowed))}"))
+        return 0
+
+    if action == "allow":
+        if not args.value:
+            print(bad("give a chat id: toony telegram allow 123456789"),
+                  file=sys.stderr)
+            return 2
+        chats = sorted({*map(str, config.get("telegram.allowed_chats", [])),
+                        *args.value})
+        config.set("telegram.allowed_chats", chats)
+        print(ok(f"allowed: {', '.join(chats)}"))
+        _telegram_daemon("start")
+        return 0
+
+    if action == "forbid":
+        chats = [c for c in map(str, config.get("telegram.allowed_chats", []))
+                 if c not in (args.value or [])]
+        config.set("telegram.allowed_chats", chats)
+        print(ok("removed"))
+        _telegram_daemon("start")
+        return 0
+
+    if action == "test":
+        token = config.api_key("telegram", "token")
+        if not token:
+            print(bad("no token set — run: toony telegram setup"), file=sys.stderr)
+            return 1
+        if not online():
+            print(bad("no internet — Telegram is unreachable from here"),
+                  file=sys.stderr)
+            return 1
+        try:
+            print(ok(f"the token works: {describe_bot(token)}"))
+        except TelegramError as exc:
+            print(bad(str(exc)), file=sys.stderr)
+            return 1
+        return 0
+
+    if action == "setup":
+        return _telegram_setup(config)
+
+    print(bad(f"unknown action {action}"), file=sys.stderr)
+    return 2
+
+
+def _telegram_setup(config) -> int:
+    """The whole thing, one question at a time."""
+    import secrets
+
+    from .bridges.telegram import TelegramError, describe_bot, online
+
+    print(bold("\nTelegram — talk to Toony from your phone\n"))
+    if not online():
+        print(warn("This machine cannot reach Telegram right now."))
+        print(dim("  You can still set it up; it will connect when the network "
+                  "comes back.\n"))
+
+    token = str(config.get("telegram.token", "") or "")
+    if token:
+        print(dim(f"  A token is already set ({_mask(token)})."))
+        if not _yes("Replace it?", default=False):
+            return _finish_telegram_setup(config, token)
+
+    print(_BOTFATHER)
+    try:
+        token = input("\n  token: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return 1
+    if not token:
+        print(bad("nothing entered — stopping here"), file=sys.stderr)
+        return 1
+    if ":" not in token:
+        print(warn("that does not look like a bot token, but carrying on"))
+
+    if online():
+        try:
+            print(ok(f"  connected: {describe_bot(token)}"))
+        except TelegramError as exc:
+            print(bad(f"  {exc}"), file=sys.stderr)
+            if not _yes("Save it anyway?", default=False):
+                return 1
+    config.set("telegram.token", token, save=False)
+    return _finish_telegram_setup(config, token)
+
+
+def _finish_telegram_setup(config, token: str) -> int:
+    import secrets
+
+    code = str(config.get("telegram.pairing_code", "") or "")
+    if not code:
+        code = secrets.token_hex(3).upper()
+    config.set("telegram.pairing_code", code, save=False)
+    config.set("telegram.enabled", True, save=False)
+    config.save()
+
+    print()
+    print(ok("Telegram is on."))
+    print()
+    print(f"  {bold('Last step')} — open your bot on Telegram and send it "
+          f"exactly:  {ok(code)}")
+    print(dim("  That pairs your phone. Until then every message is refused, "
+              "so the\n  token alone is not enough for anybody else to use it."))
+    print()
+    print(dim("  Then just talk to it. Try: what is wrong with my system?"))
+    print(dim("  Check on it later with: toony telegram status"))
+    _telegram_daemon("start")
+    return 0
+
+
+def _telegram_status(config) -> int:
+    from . import ipc
+    from .bridges.telegram import online
+
+    enabled = bool(config.get("telegram.enabled", False))
+    token = config.api_key("telegram", "token")
+    chats = [str(c) for c in config.get("telegram.allowed_chats", [])]
+
+    print(f"{bold('telegram')} {ok('on') if enabled else dim('off')}")
+    print(f"  token          {_mask(token) if token else bad('not set')}")
+    print(f"  internet       {ok('reachable') if online(2) else warn('unreachable')}")
+    print(f"  paired chats   {', '.join(chats) if chats else warn('none yet')}")
+    print(f"  message limit  {config.get('telegram.max_message_chars'):,} characters")
+    print(f"  backlog limit  {config.get('telegram.max_backlog')} messages")
+
+    reply = ipc.send("telegram", action="status", timeout=10)
+    if reply.get("ok"):
+        live = reply["telegram"]
+        state = ok("running") if live.get("running") else warn("not running")
+        print(f"  bridge         {state}")
+        if live.get("running"):
+            print(f"  handled        {live.get('messages', 0)} messages, "
+                  f"{live.get('rejected', 0)} refused")
+        if live.get("error"):
+            print(f"  last error     {warn(live['error'])}")
+    elif _offline(reply):
+        print(dim("  bridge         (Toony is not running)"))
+
+    if enabled and not chats:
+        print()
+        print(warn("Nobody is paired yet, so every message is refused."))
+        print(dim("  Run: toony telegram pair"))
+    if not enabled:
+        print(dim("\n  Set it up with: toony telegram setup"))
+    return 0
+
+
+def _mask(token: str) -> str:
+    return f"{token[:8]}…{token[-4:]}" if len(token) > 14 else "set"
+
+
+def _telegram_daemon(action: str) -> None:
+    from . import ipc
+
+    if ipc.is_running():
+        ipc.send("telegram", action=action, timeout=30)
+
+
+def _yes(question: str, default: bool = True) -> bool:
+    suffix = "[Y/n]" if default else "[y/N]"
+    try:
+        answer = input(f"  {question} {suffix} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if not answer:
+        return default
+    return answer in ("y", "yes")
 
 
 # ------------------------------------------------------------------ presets
@@ -1365,6 +1770,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             getting started
+              toony setup                   everything, one question at a time
               toony install                 install the service and the hotkey
               toony doctor                  check what is missing
               toony voices install en_US-amy-medium
@@ -1376,6 +1782,7 @@ def build_parser() -> argparse.ArgumentParser:
               toony use local               everything on this laptop
               toony personality spicy       let it be funny about it
               toony wakeword "hey toony"    set the wake phrase
+              toony telegram setup          message it from your phone
               toony config list brain       show the brain settings
               toony config set brain.provider claude
               toony config set brain.claude.api_key_env ANTHROPIC_API_KEY
@@ -1469,6 +1876,21 @@ def build_parser() -> argparse.ArgumentParser:
     shortcut_parser.add_argument("--clear", action="store_true",
                                  help="remove the binding")
     shortcut_parser.set_defaults(func=cmd_shortcut)
+
+    setup_parser = subparsers.add_parser(
+        "setup", help="set everything up, one question at a time")
+    setup_parser.set_defaults(func=cmd_setup, no_start=False, no_shortcut=False,
+                              no_autostart=False)
+
+    telegram_parser = subparsers.add_parser(
+        "telegram", aliases=["tg"], help="talk to Toony from your phone")
+    telegram_parser.add_argument(
+        "action", nargs="?", default="status",
+        choices=["status", "setup", "pair", "allow", "forbid", "test", "off"])
+    telegram_parser.add_argument("value", nargs="*", help="chat ids for allow/forbid")
+    telegram_parser.add_argument("--new-code", action="store_true",
+                                 help="generate a fresh pairing code")
+    telegram_parser.set_defaults(func=cmd_telegram)
 
     use_parser = subparsers.add_parser(
         "use", help="switch the whole stack between local and cloud")
