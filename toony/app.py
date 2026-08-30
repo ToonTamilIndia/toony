@@ -480,7 +480,7 @@ class Assistant:
             finally:
                 self.state = "idle"
         if request.get("speak", True) and reply:
-            threading.Thread(target=self.say, args=(reply,), daemon=True).start()
+            threading.Thread(target=self.say, args=(reply, False), daemon=True).start()
         return {"ok": True, "reply": reply,
                 "conversation": self.agent.conversation.id,
                 "title": self.agent.conversation.display_title()}
@@ -489,7 +489,7 @@ class Assistant:
         text = str(request.get("text", "")).strip()
         if not text:
             return {"ok": False, "error": "no text given"}
-        threading.Thread(target=self.say, args=(text,), daemon=True).start()
+        threading.Thread(target=self.say, args=(text, False), daemon=True).start()
         return {"ok": True, "action": "speaking"}
 
     def _cmd_confirm(self, request: dict) -> dict:
