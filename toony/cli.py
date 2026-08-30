@@ -1031,15 +1031,19 @@ def _shortcut_status(shortcut: str) -> int:
     else:
         print(f"  {ok('ok')}      nothing else claims {shortcut}")
 
-    running = subprocess.call(["pgrep", "-x", "-u", str(os.getuid()),
-                               "kglobalacceld"], stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL) == 0 \
-        if shutil.which("pgrep") else None
-    if running is False:
-        healthy = False
-        print(f"  {bad('stopped')} kglobalacceld is not running")
-    elif running:
-        print(f"  {ok('ok')}      kglobalacceld is running")
+    session = os.environ.get("XDG_SESSION_TYPE", "unknown")
+    if session == "wayland":
+        print(f"  {ok('ok')}      wayland session — kglobalacceld runs inside kwin")
+    else:
+        running = subprocess.call(["pgrep", "-x", "-u", str(os.getuid()),
+                                    "kglobalacceld"], stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL) == 0 \
+            if shutil.which("pgrep") else None
+        if running is False:
+            healthy = False
+            print(f"  {bad('stopped')} kglobalacceld is not running")
+        elif running:
+            print(f"  {ok('ok')}      kglobalacceld is running")
 
     if ipc.is_running():
         print(f"  {ok('ok')}      the daemon is up and answering")
