@@ -486,6 +486,41 @@ def cmd_doctor(args) -> int:
         except Exception as exc:
             check(label, False, f"{exc.__class__.__name__}: {exc}")
 
+    print(bold("\nspeed"))
+    from .brain import discovery
+    from .brain import ollama as ollama_api
+    from .audio import hotkey as hotkey_mod
+
+    chain = _routing_chain(config)
+    check("model fallback", len(chain) > 1,
+          " -> ".join(chain) if len(chain) > 1
+          else _no_fallback_reason(config, chain), fatal=False)
+    base_url = str(config.get("brain.ollama.base_url"))
+    if discovery.ollama_running(base_url):
+        resident = ollama_api.loaded(base_url)
+        warm = bool(config.get("brain.ollama.keep_warm", True))
+        check("local model loaded", bool(resident),
+              ollama_api.describe_loaded(base_url) if resident
+              else ("nothing loaded — the next question waits ten to twenty "
+                    "seconds for the weights"
+                    + ("" if warm else "; brain.ollama.keep_warm is off")),
+              fatal=False)
+    check("push-to-talk", hotkey_mod.usable(),
+          "reading the keyboard directly (~10ms, and hold mode works)"
+          if hotkey_mod.usable()
+          else "through the KDE shortcut (~60-150ms, no hold mode) — "
+               "toony ptt --setup",
+          fatal=False)
+    preroll = int(config.get("audio.preroll_ms", 700))
+    check("microphone pre-roll", preroll > 0,
+          f"{preroll}ms kept from before the key press" if preroll
+          else "off — the first syllable of each sentence will be clipped",
+          fatal=False)
+    routines = config.get("automation.routines", []) or []
+    check("routines", True,
+          f"{len(routines)} configured" if routines
+          else "none — add one with: toony routine add", fatal=False)
+
     print(bold("\nservice"))
     check("config file", CONFIG_FILE.exists(),
           str(CONFIG_FILE) if CONFIG_FILE.exists()
@@ -1136,23 +1171,54 @@ def _choose(question: str, options: list[tuple[str, str]], default: str) -> str:
 
 
 def _setup_brain(config) -> None:
+    from .brain import discovery
+
+    # Look before asking. Half the setup questions people get wrong are ones
+    # the machine could have answered itself.
+    found = discovery.probe(config)
+    if found.ollama_models:
+        print(dim(f"\n  found {len(found.ollama_models)} local model(s): "
+                  f"{', '.join(found.ollama_models[:4])}"))
+    for provider, present in sorted(found.keys.items()):
+        if present:
+            print(dim(f"  found an API key for {provider}"))
+
     choice = _choose("Which model should answer you?", [
         ("local", "Ollama on this laptop. No key, no network, nothing leaves."),
         ("cloud", "Claude. Much better answers; needs an API key."),
-    ], "local")
+    ], "cloud" if found.keys.get("claude") and not found.ollama_models else "local")
+
     if choice == "local":
         config.set("brain.provider", "ollama", save=False)
-        print(dim("  Make sure Ollama is running: ollama serve"))
-        print(dim(f"  and that you have the model: ollama pull "
-                  f"{config.get('brain.ollama.model')}"))
-        return
-    config.set("brain.provider", "claude", save=False)
-    if not config.api_key("brain.claude"):
-        key = input("  Anthropic API key (Enter to use $ANTHROPIC_API_KEY): ").strip()
-        if key:
-            config.set("brain.claude.api_key", key, save=False)
+        picked = discovery.best_local(found.ollama_models)
+        if picked:
+            config.set("brain.ollama.model", picked, save=False)
+            print(dim(f"  Using {picked} — the best of what you have installed."))
+        elif found.ollama_up:
+            print(warn("  Ollama is running but has no models."))
+            print(dim("  Get one with: toony models --pull qwen2.5:7b"))
         else:
-            print(dim("  Fine — export ANTHROPIC_API_KEY before starting Toony."))
+            print(dim("  Make sure Ollama is running: ollama serve"))
+            print(dim(f"  and that you have the model: ollama pull "
+                      f"{config.get('brain.ollama.model')}"))
+    else:
+        config.set("brain.provider", "claude", save=False)
+        if not config.api_key("brain.claude"):
+            key = input("  Anthropic API key (Enter to use "
+                        "$ANTHROPIC_API_KEY): ").strip()
+            if key:
+                config.set("brain.claude.api_key", key, save=False)
+            else:
+                print(dim("  Fine — export ANTHROPIC_API_KEY before starting "
+                          "Toony."))
+
+    # The point of the fallback chain, said once, at the moment it makes sense.
+    if choice == "cloud" and found.ollama_models:
+        print(dim("\n  Your local model stays as a backup: when there is no "
+                  "network, it answers instead of an apology."))
+    elif choice == "cloud":
+        print(dim("\n  With no local model, no network means no answers. "
+                  "Consider: toony models --pull qwen2.5:7b"))
 
 
 def _setup_voice(config) -> None:
@@ -1487,8 +1553,11 @@ def _show_stack(config) -> int:
     from .brain import vision_summary
 
     brain = str(config.get("brain.provider"))
+    chain = _routing_chain(config)
     rows = [
         ("brain", f"{brain}:{config.get(f'brain.{brain}.model')}"),
+        ("fallback", " -> ".join(chain[1:]) if len(chain) > 1
+                     else _no_fallback_reason(config, chain)),
         ("vision", vision_summary(config)),
         ("ears", _stack_line(config, "stt")),
         ("voice", _stack_line(config, "tts")),
@@ -1767,6 +1836,344 @@ def cmd_logs(args) -> int:
 
 
 # ---------------------------------------------------------------------- main
+
+def cmd_models(args) -> int:
+    """What this machine can talk to, and how to make it faster."""
+    from .brain import discovery
+    from .brain import ollama as ollama_api
+
+    config = Config.load()
+    base_url = str(config.get("brain.ollama.base_url"))
+
+    if args.pull:
+        return _pull_model(args.pull, base_url)
+
+    found = discovery.probe(config)
+    print(bold("what is available"))
+    print(discovery.summarise(found))
+
+    if found.ollama_up:
+        print()
+        print(bold("loaded right now"))
+        print("  " + ollama_api.describe_loaded(base_url))
+        if not ollama_api.loaded(base_url):
+            print(dim("  Ollama unloads a model after a few minutes idle, and "
+                      "the next question waits for it to come back. "
+                      "brain.ollama.keep_warm stops that."))
+
+    print()
+    print(bold("in use"))
+    chain = _routing_chain(config)
+    for index, label in enumerate(chain):
+        print(f"  {index + 1}. {label}" + ("" if index else dim("   <- first choice")))
+    if len(chain) > 1:
+        print(dim("\n  Later entries answer when the earlier ones cannot — no "
+                  "network, no key, rate limited."))
+
+    if args.auto:
+        return _adopt_best(config, found)
+    if found.best and not _matches(config, found.best):
+        print()
+        print(warn(f"{found.best} looks like a better fit than what is "
+                   f"configured."))
+        print(dim("  take it with: toony models --auto"))
+    return 0
+
+
+def _matches(config, candidate) -> bool:
+    provider = str(config.get("brain.provider", "")).lower()
+    return (provider == candidate.provider
+            and str(config.get(f"brain.{provider}.model", "")) == candidate.model)
+
+
+def _adopt_best(config, found) -> int:
+    if not found.best:
+        print(bad("There is nothing to switch to."), file=sys.stderr)
+        return 1
+    best = found.best
+    config.set("brain.provider", best.provider, save=False)
+    config.set(f"brain.{best.provider}.model", best.model, save=False)
+    config.save()
+    print()
+    print(ok(f"now using {best} ({best.reason})"))
+    _reload_daemon()
+    return 0
+
+
+def _no_fallback_reason(config, chain: list[str]) -> str:
+    """Why there is only one backend — which is a different problem each time."""
+    setting = config.get("brain.fallback", "auto")
+    if str(setting).lower() in ("off", "none", "false"):
+        return f"only {chain[0]} — brain.fallback is off"
+    return (f"only {chain[0]} is usable. Nothing answers when it cannot: "
+            f"set a cloud key, or install a local model with "
+            f"'toony models --pull qwen2.5:7b'")
+
+
+def _routing_chain(config) -> list[str]:
+    from .brain.router import build_routes
+
+    try:
+        return [route.label for route in build_routes(config)] or ["(nothing)"]
+    except Exception as exc:
+        return [f"(could not work it out: {exc})"]
+
+
+def _pull_model(model: str, base_url: str) -> int:
+    from .brain import ollama as ollama_api
+
+    print(f"pulling {bold(model)} …")
+    last = ""
+    try:
+        for event in ollama_api.pull(model, base_url):
+            if event.get("error"):
+                print(bad(event["error"]), file=sys.stderr)
+                return 1
+            status = str(event.get("status", ""))
+            total, done = event.get("total"), event.get("completed")
+            if total and done:
+                status = f"{status} {done * 100 / total:.0f}%"
+            if status != last:
+                print(f"\r  {status:<60}", end="", flush=True)
+                last = status
+    except Exception as exc:
+        print(bad(f"\ncould not pull {model}: {exc}"), file=sys.stderr)
+        return 1
+    print(f"\r  {ok('done'):<60}")
+    return 0
+
+
+def cmd_ptt(args) -> int:
+    """Look at, test and repair push-to-talk."""
+    from .audio import hotkey
+
+    config = Config.load()
+    engine = str(config.get("ptt.engine", "auto"))
+    mode = str(config.get("ptt.mode", "toggle"))
+    shortcut = str(config.get("ptt.shortcut", "Meta+Space"))
+
+    if args.mode:
+        config.set("ptt.mode", args.mode)
+        mode = args.mode
+        print(ok(f"push-to-talk mode is now {mode}"))
+    if args.engine:
+        config.set("ptt.engine", args.engine)
+        engine = args.engine
+        print(ok(f"push-to-talk engine is now {engine}"))
+    if args.mode or args.engine:
+        _reload_daemon()
+        print()
+
+    print(f"{bold('key')}      {shortcut}")
+    print(f"{bold('mode')}     {mode}")
+    print(f"{bold('engine')}   {engine}")
+    print()
+    print(bold("reading the keyboard directly"))
+    print("  " + hotkey.diagnose().replace("\n", "\n  "))
+
+    usable = hotkey.usable()
+    if mode == "hold" and not usable and engine != "evdev":
+        print()
+        print(warn("Hold mode cannot work through a KDE shortcut: the "
+                   "compositor runs a command when the key goes down and says "
+                   "nothing when it comes up. Either fix the permission above, "
+                   "or use toggle mode:"))
+        print(dim("  toony ptt --mode toggle"))
+
+    print()
+    print(bold("latency"))
+    preroll = int(config.get("audio.preroll_ms", 700))
+    keep = bool(config.get("audio.keep_stream_open", True))
+    print(f"  pre-roll kept       {preroll}ms"
+          + ("" if preroll else dim("   (the first syllable will be clipped)")))
+    print(f"  microphone held open {'yes' if keep else 'no'}")
+    if usable:
+        print(dim("  reading the keyboard directly: roughly 10ms to the daemon"))
+    else:
+        print(dim("  through the KDE shortcut: roughly 60-150ms to the daemon"))
+
+    if args.watch:
+        return _watch_key(config)
+    if args.setup:
+        return _ptt_setup()
+    return 0
+
+
+def _ptt_setup() -> int:
+    import getpass
+
+    from .audio import hotkey
+
+    if hotkey.usable():
+        print(ok("already set up — the keyboard can be read directly"))
+        return 0
+    if not hotkey.keyboards():
+        print(warn("no keyboards found under /dev/input. Nothing to set up."))
+        return 1
+    user = getpass.getuser()
+    print("The keyboard devices belong to the 'input' group. Run:")
+    print()
+    print(bold(f"  sudo usermod -aG input {user}"))
+    print()
+    print("then log out and back in (a new terminal is not enough — the group "
+          "is fixed at login).")
+    return 0
+
+
+def _watch_key(config) -> int:
+    """Press the key and see whether it is seen, and how quickly."""
+    import threading
+    import time
+
+    from .audio import hotkey
+
+    shortcut = str(config.get("ptt.shortcut", "Meta+Space"))
+    try:
+        listener = hotkey.HotkeyListener(shortcut, lambda: None)
+    except hotkey.HotkeyUnavailable as exc:
+        print(bad(str(exc)), file=sys.stderr)
+        return 1
+
+    seen = threading.Event()
+    down: list[float] = []
+
+    def pressed() -> None:
+        down.append(time.monotonic())
+        print(f"  {ok('down')}  {shortcut}")
+
+    def released() -> None:
+        held = (time.monotonic() - down[-1]) * 1000 if down else 0
+        print(f"  {dim('up')}    held for {held:.0f}ms")
+        seen.set()
+
+    listener.on_press, listener.on_release = pressed, released
+    try:
+        listener.start()
+    except hotkey.HotkeyUnavailable as exc:
+        print(bad(str(exc)), file=sys.stderr)
+        return 1
+
+    print()
+    print(f"Press {bold(shortcut)} — Ctrl+C to stop.")
+    try:
+        while not seen.wait(0.5):
+            pass
+        seen.clear()
+        while True:
+            seen.wait(0.5)
+            seen.clear()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        listener.stop()
+    return 0
+
+
+def cmd_routine(args) -> int:
+    """Things Toony does without being asked."""
+    from .automation import BadRoutine, Routine, load, save
+
+    config = Config.load()
+    routines = load(config)
+    action = args.action or "list"
+
+    if action == "list":
+        if not routines:
+            print(dim("no routines yet"))
+            print()
+            print("Add one:")
+            print(bold('  toony routine add "morning" "at 08:30" '
+                       '"anything wrong with this machine overnight?"'))
+            print(bold('  toony routine add "updates" "every 6h" '
+                       '"check for system updates, do not install them"'))
+            print(bold('  toony routine add "battery" "on battery_low" '
+                       '"tell me the battery is low in one short sentence"'))
+            return 0
+        status = _daemon_routines()
+        for routine in routines:
+            line = routine.describe()
+            when = status.get(routine.name)
+            if when is not None:
+                line += dim(f"   (next in {_pretty_seconds(when)})")
+            print("  " + line)
+        quiet = str(config.get("automation.quiet_hours", ""))
+        if quiet:
+            print(dim(f"\n  quiet between {quiet} — they still run, they just "
+                      f"do not speak"))
+        return 0
+
+    if action == "add":
+        if len(args.rest) < 3:
+            print(bad('usage: toony routine add "<name>" "<when>" "<prompt>"'),
+                  file=sys.stderr)
+            return 2
+        name, when, *prompt = args.rest
+        try:
+            routine = Routine.from_dict({"name": name, "when": when,
+                                         "prompt": " ".join(prompt),
+                                         "speak": not args.quiet})
+        except BadRoutine as exc:
+            print(bad(str(exc)), file=sys.stderr)
+            return 2
+        routines = [r for r in routines if r.name != name] + [routine]
+        save(config, routines)
+        print(ok(f"added: {routine.describe()}"))
+        _reload_daemon()
+        return 0
+
+    name = " ".join(args.rest).strip()
+    if not name:
+        print(bad(f"which routine? usage: toony routine {action} <name>"),
+              file=sys.stderr)
+        return 2
+    match = next((r for r in routines if r.name == name), None)
+    if match is None:
+        print(bad(f"There is no routine called {name!r}."), file=sys.stderr)
+        if routines:
+            print(dim("  " + ", ".join(r.name for r in routines)), file=sys.stderr)
+        return 1
+
+    if action == "remove":
+        save(config, [r for r in routines if r is not match])
+        print(ok(f"removed {name!r}"))
+    elif action in ("enable", "disable"):
+        match.enabled = action == "enable"
+        save(config, routines)
+        print(ok(f"{name!r} is {'on' if match.enabled else 'off'}"))
+    elif action == "run":
+        print(dim(f"running {name!r} now …"))
+        reply = ipc.send("ask", text=match.prompt, speak=match.speak,
+                         timeout=180)
+        if not reply.get("ok"):
+            print(bad(reply.get("error", "the daemon could not run it")),
+                  file=sys.stderr)
+            return 1
+        print(reply.get("reply", ""))
+        return 0
+    _reload_daemon()
+    return 0
+
+
+def _daemon_routines() -> dict:
+    """When each routine is next due, if the daemon is running to know."""
+    try:
+        reply = ipc.send("status", timeout=3)
+    except Exception:
+        return {}
+    block = (reply.get("routines") or {}) if reply.get("ok") else {}
+    return {r["name"]: r["in_s"] for r in block.get("routines", [])
+            if r.get("in_s") is not None}
+
+
+def _pretty_seconds(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 90:
+        return f"{seconds}s"
+    if seconds < 5400:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="toony",
@@ -1951,6 +2358,35 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall_parser = subparsers.add_parser("uninstall",
                                              help="remove the service and hotkey")
     uninstall_parser.set_defaults(func=cmd_uninstall)
+
+    models_parser = subparsers.add_parser(
+        "models", help="what this machine can talk to, and how fast")
+    models_parser.add_argument("--auto", action="store_true",
+                               help="switch to the best available model")
+    models_parser.add_argument("--pull", metavar="MODEL",
+                               help="download a model into Ollama")
+    models_parser.set_defaults(func=cmd_models)
+
+    ptt_parser = subparsers.add_parser(
+        "ptt", help="check, tune and test push-to-talk")
+    ptt_parser.add_argument("--mode", choices=["toggle", "hold"])
+    ptt_parser.add_argument("--engine", choices=["auto", "evdev", "shortcut"])
+    ptt_parser.add_argument("--setup", action="store_true",
+                            help="explain how to read the keyboard directly")
+    ptt_parser.add_argument("--watch", action="store_true",
+                            help="press the key and see whether it is seen")
+    ptt_parser.set_defaults(func=cmd_ptt)
+
+    routine_parser = subparsers.add_parser(
+        "routine", help="things Toony does without being asked")
+    routine_parser.add_argument(
+        "action", nargs="?", default="list",
+        choices=["list", "add", "remove", "enable", "disable", "run"])
+    routine_parser.add_argument("rest", nargs="*",
+                                help='for add: "<name>" "<when>" "<prompt>"')
+    routine_parser.add_argument("--quiet", action="store_true",
+                                help="do not say the answer out loud")
+    routine_parser.set_defaults(func=cmd_routine)
 
     logs_parser = subparsers.add_parser("logs", help="show the log")
     logs_parser.add_argument("-f", "--follow", action="store_true")

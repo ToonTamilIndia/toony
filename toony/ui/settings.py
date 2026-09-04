@@ -30,9 +30,30 @@ HINTS: dict[str, tuple] = {
     "brain.max_history_turns": ((1, 100), "How much of the conversation the "
                                           "model is shown."),
     "brain.max_tool_iterations": ((1, 20), "How many tool rounds one answer may take."),
+    "brain.fallback": (["auto", "off"],
+                       "What answers when your choice cannot. Auto falls back "
+                       "to the local model when there is no network."),
+    "brain.fallback_cooldown_s": ((10, 900), "How long a backend that failed "
+                                             "is rested before it is retried."),
+    "brain.announce_fallback": (None, "Say so when the answer came from "
+                                      "somewhere other than usual."),
+    "brain.auto_model": (None, "Use the best model that is actually installed, "
+                               "rather than failing on one that was never "
+                               "pulled."),
+    "brain.ollama.keep_warm": (None, "Keep the local model loaded while you are "
+                                     "using Toony. Without this the first "
+                                     "question after a break waits ten to "
+                                     "twenty seconds for the weights."),
+    "brain.ollama.keep_alive": (None, "How long Ollama holds the model after "
+                                      "the last question, e.g. 30m."),
+    "brain.ollama.keep_warm_minutes": ((0, 720),
+                                       "Stop keeping it warm after this long "
+                                       "unused, so the GPU is freed overnight."),
     "stt.provider": (["local", "openai"], "Where speech is turned into text."),
-    "stt.local.model": (["tiny", "base", "small", "medium", "large-v3"],
-                        "Bigger is more accurate and slower."),
+    "stt.local.model": (["auto", "tiny", "base", "base.en", "small", "medium",
+                         "large-v3"],
+                        "Bigger is more accurate and slower. Auto picks 'small' "
+                        "on the GPU and 'base.en' without one."),
     "stt.local.device": (["auto", "cuda", "cpu"], "cuda uses the RTX 3050."),
     "stt.local.compute_type": (["auto", "float16", "int8_float16", "int8"], ""),
     "tts.provider": (["piper", "espeak", "openai"], "Which voice speaks."),
@@ -89,8 +110,29 @@ HINTS: dict[str, tuple] = {
     "audio.max_utterance_s": ((5, 120), ""),
     "audio.energy_threshold": ((0.001, 0.2), "Raise it in a noisy room."),
     "audio.vad_aggressiveness": ((0, 3), ""),
-    "ptt.mode": (["toggle", "hold"], "Toggle: press to start, press to stop."),
+    "ptt.mode": (["toggle", "hold"], "Toggle: press to start, press to stop. "
+                                     "Hold needs the evdev engine, because a "
+                                     "KDE shortcut has no key-release event."),
     "ptt.shortcut": (None, "Rebind with: toony shortcut \"Meta+Space\""),
+    "ptt.engine": (["auto", "evdev", "shortcut"],
+                   "How the key is watched. evdev reads the keyboard directly: "
+                   "both press and release, and about ten milliseconds instead "
+                   "of a hundred. Check it with: toony ptt --status"),
+    "ptt.double_tap_cancel": (None, "Tap the key twice quickly to throw the "
+                                    "turn away instead of sending it."),
+    "ptt.double_tap_ms": ((150, 1000), ""),
+    "audio.preroll_ms": ((0, 2000),
+                         "How much audio from before the key press is kept. "
+                         "This is what stops the first syllable going missing."),
+    "audio.keep_stream_open": (None, "Hold the microphone open between turns. "
+                                     "Opening one costs up to 400ms, paid "
+                                     "after the key press if it is not."),
+    "audio.stream_idle_s": ((0, 3600), "Release the microphone after this long "
+                                       "unused. 0 keeps it forever."),
+    "automation.enabled": (None, "Run routines. Add one with: toony routine add"),
+    "automation.quiet_hours": (None, "Routines still run in this window, they "
+                                     "just do not speak. E.g. 22:30-07:30."),
+    "automation.battery_low_percent": ((5, 60), ""),
     "tools.policy_safe": (["allow", "ask", "deny"], "Reading state: volume, time."),
     "tools.policy_sensitive": (["allow", "ask", "deny"],
                                "Changing things: volume, apps, clipboard."),
@@ -105,6 +147,11 @@ HINTS: dict[str, tuple] = {
                                 "window, because Wayland has no window opacity."),
     "ui.frameless": (None, "Use Toony's own title bar. Turn it off for the "
                            "normal KDE one if dragging misbehaves."),
+    "ui.pinned": (None, "Keep the window in front of everything, on every "
+                        "virtual desktop, and stop it hiding on Escape. The "
+                        "pin in the title bar toggles it too."),
+    "ui.always_on_top": (None, "The old name for 'pinned'. Leave it off; the "
+                               "pin is what gets saved now."),
     "ui.orb": (None, "A floating circle whose ring shows what Toony is doing. "
                      "Click it to talk, Ctrl-drag to move it."),
     "ui.orb_size": ((48, 160), "How big the floating circle is."),

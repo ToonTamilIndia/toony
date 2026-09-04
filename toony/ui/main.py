@@ -104,53 +104,108 @@ _TRAY_TOOLTIP = {
     "thinking": "thinking", "speaking": "speaking", "offline": "not running",
 }
 
+_MENU_STATUS = {
+    "idle": "Ready", "starting": "Starting up…", "listening": "Listening…",
+    "thinking": "Thinking…", "speaking": "Speaking…",
+    "offline": "Not running — start it with: toony start",
+}
 
-def _build_menu(app, window, client, config, orb, open_settings):
+
+def _menu_icon(name: str, config):
+    """Menu artwork in the palette's own text colour, or nothing."""
+    from . import icons, theme
+
+    colours = theme.palette(str(config.get("ui.theme", "auto")),
+                            str(config.get("ui.accent", "#7c5cff")))
+    return icons.icon(name, colours["text"])
+
+
+def _act(menu, label: str, handler, config=None, shape: str = ""):
+    action = menu.addAction(label)
+    action.triggered.connect(lambda _checked=False: handler())
+    if shape and config is not None:
+        drawn = _menu_icon(shape, config)
+        if drawn is not None:
+            action.setIcon(drawn)
+    return action
+
+
+def _build_menu(app, window, client, config, orb, open_settings, state):
+    """The tray menu, rebuilt every time it opens.
+
+    It used to be filled once at start-up, which meant every tick box in it
+    showed whatever the setting had been when Toony launched — turn the wake
+    word off in Settings and the tray still claimed it was on. Rebuilding on
+    ``aboutToShow`` costs nothing and can never be stale.
+    """
     from PySide6.QtWidgets import QMenu
 
     menu = QMenu()
-    _fill_menu(menu, app, window, client, config, orb, open_settings)
+    menu.aboutToShow.connect(
+        lambda: _fill_menu(menu, app, window, client, config, orb,
+                           open_settings, state()))
+    _fill_menu(menu, app, window, client, config, orb, open_settings, state())
     return menu
 
 
-def _fill_menu(menu, app, window, client, config, orb, open_settings) -> None:
+def _fill_menu(menu, app, window, client, config, orb, open_settings,
+               state: str = "idle") -> None:
     """The menu behind the tray icon and the orb. Both show the same thing.
 
     Everything here is something you would otherwise open a terminal for.
     """
-    menu.addAction("Talk to Toony", window.start_listening)
-    menu.addAction("Stop talking", window.interrupt)
+    menu.clear()
+    name = str(config.get("general.name", "Toony"))
+    heading = menu.addAction(f"{name} — {_MENU_STATUS.get(state, state)}")
+    heading.setEnabled(False)
     menu.addSeparator()
-    menu.addAction("Open the window", window.toggle_visible)
-    menu.addAction("New conversation", window.new_conversation)
+
+    busy = state in ("listening", "thinking", "speaking")
+    if busy:
+        _act(menu, "Stop talking", window.interrupt, config, "stop")
+    else:
+        _act(menu, "Talk to Toony", window.start_listening, config, "mic")
+    _act(menu, "Hide the window" if window.isVisible() else "Open the window",
+         window.toggle_visible, config, "menu")
+    _act(menu, "New conversation", window.new_conversation, config, "new")
 
     recent = menu.addMenu("Recent conversations")
     recent.aboutToShow.connect(lambda: _fill_recent(recent, client, window))
 
     menu.addSeparator()
+    pin = menu.addAction("Pin to the desktop")
+    pin.setCheckable(True)
+    pin.setChecked(bool(getattr(window, "pinned", False)))
+    pin.setToolTip("Keep Toony in front, on every virtual desktop.")
+    pin.toggled.connect(window.set_pinned)
+
+    routines = menu.addMenu("Routines")
+    routines.aboutToShow.connect(lambda: _fill_routines(routines, client, config))
+
     quick = menu.addMenu("Quick settings")
     _add_toggle(quick, "Wake word", config, client, "wakeword.enabled")
+    _add_toggle(quick, "Run routines", config, client, "automation.enabled")
     _add_toggle(quick, "Stop when I talk over it", config, client,
                 "audio.barge_in")
     _add_toggle(quick, "Speak replies", config, client, "tts.stream")
     if orb is not None:
-        action = quick.addAction("Hide the orb")
-        action.triggered.connect(orb.hide)
+        _act(quick, "Show the orb" if orb.isVisible() else "Hide the orb",
+             orb.hide if orb.isVisible() else orb.show)
 
     personality = quick.addMenu("Personality")
+    current = str(config.get("general.personality"))
     for style in ("plain", "friendly", "spicy"):
         action = personality.addAction(style.capitalize())
         action.setCheckable(True)
-        action.setChecked(str(config.get("general.personality")) == style)
+        action.setChecked(current == style)
         action.triggered.connect(
             lambda _checked, s=style: _set(client, config,
                                            "general.personality", s))
 
-    menu.addAction("Settings…", open_settings)
+    _act(menu, "Settings…", open_settings, config, "settings")
     menu.addSeparator()
-    menu.addAction("Restart the assistant",
-                   lambda: client.send("reload", timeout=60))
-    menu.addAction("Quit", app.quit)
+    _act(menu, "Restart the assistant", lambda: client.send("reload", timeout=60))
+    _act(menu, "Quit", app.quit, config, "close")
 
 
 def _add_toggle(menu, label: str, config, client, key: str) -> None:
@@ -163,6 +218,56 @@ def _add_toggle(menu, label: str, config, client, key: str) -> None:
 def _set(client, config, key: str, value) -> None:
     config.set(key, value, save=False)
     client.send("config", timeout=60, action="set", values={key: value})
+
+
+def _fill_routines(menu, client, config) -> None:
+    """The things Toony does on its own, and whether they are due.
+
+    Filled when the submenu opens rather than when the tray is built: "in 42
+    minutes" is only true at the moment it is read.
+    """
+    menu.clear()
+    menu.addAction("Loading…").setEnabled(False)
+
+    def arrived(reply: dict) -> None:
+        menu.clear()
+        entries = ((reply.get("routines") or {}).get("routines", [])
+                   if reply.get("ok") else [])
+        if not entries:
+            hint = menu.addAction("No routines yet")
+            hint.setEnabled(False)
+            tip = menu.addAction('Add one:  toony routine add')
+            tip.setEnabled(False)
+            return
+        for entry in entries:
+            due = entry.get("in_s")
+            when = entry["when"] if due is None else f"{entry['when']} · in {_soon(due)}"
+            action = menu.addAction(f"{entry['name']}   ({when})")
+            action.setCheckable(True)
+            action.setChecked(bool(entry.get("enabled", True)))
+            action.setToolTip(entry.get("error") or "")
+            action.triggered.connect(
+                lambda checked, name=entry["name"]: _toggle_routine(
+                    client, config, name, checked))
+
+    client.send("status", arrived, timeout=5)
+
+
+def _toggle_routine(client, config, name: str, enabled: bool) -> None:
+    routines = list(config.get("automation.routines", []) or [])
+    for entry in routines:
+        if isinstance(entry, dict) and entry.get("name") == name:
+            entry["enabled"] = enabled
+    _set(client, config, "automation.routines", routines)
+
+
+def _soon(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 90:
+        return f"{seconds}s"
+    if seconds < 5400:
+        return f"{seconds // 60} min"
+    return f"{seconds // 3600}h"
 
 
 def _fill_recent(menu, client, window) -> None:
@@ -190,6 +295,20 @@ def _open(window, conversation_id: str) -> None:
     window.client.send("conversation", window._on_opened, timeout=15,
                        action="open", id=conversation_id)
     window.toggle_visible()
+
+
+def _tray_clicked(reason, window) -> None:
+    """Left click opens the window; middle click starts a turn straight away.
+
+    Middle click is the one gesture nothing else on a Plasma tray uses, which
+    makes it the right home for "just listen to me" — no menu, no window.
+    """
+    from PySide6.QtWidgets import QSystemTrayIcon
+
+    if reason == QSystemTrayIcon.ActivationReason.Trigger:
+        window.toggle_visible()
+    elif reason == QSystemTrayIcon.ActivationReason.MiddleClick:
+        window.start_listening()
 
 
 def _notify_send(message: str) -> bool:
@@ -280,6 +399,10 @@ def run(start_hidden: bool | None = None) -> int:
         if orb is not None:
             orb.config = config
             orb.reload_avatar()
+        # The tray menu carries its own copy of the sheet, so a new theme or
+        # accent has to be handed to it as well or it keeps the old colours.
+        if tray is not None and tray.contextMenu() is not None:
+            tray.contextMenu().setStyleSheet(window.styleSheet())
         window.refresh()
 
     window.on_settings = open_settings
@@ -291,10 +414,17 @@ def run(start_hidden: bool | None = None) -> int:
         orb.opened.connect(window.toggle_visible)
         # Right-clicking the orb offers exactly what the tray does.
         orb.build_menu = lambda menu: _fill_menu(menu, app, window, client,
-                                                 config, orb, open_settings)
+                                                 config, orb, open_settings,
+                                                 current["state"])
+
+    # The one place the assistant's state lives on this side of the socket.
+    # The tray menu reads it when it opens, so it can say what Toony is doing
+    # and offer "Stop talking" rather than "Talk to Toony".
+    current = {"state": "starting"}
 
     def set_state(state: str) -> None:
         """One state, three places: the window, the orb and the tray icon."""
+        current["state"] = state
         if orb is not None:
             orb.set_state(state)
         if tray is not None:
@@ -307,6 +437,15 @@ def run(start_hidden: bool | None = None) -> int:
             set_state(str(event.get("state", "idle")))
         elif kind == "confirm" and orb is not None:
             orb.set_state("thinking")
+        elif kind == "brain":
+            # The model answering changed underneath you. Worth a notification:
+            # it is the difference between "the cloud one" and "the local one",
+            # and nothing else on screen would say so.
+            message = str(event.get("message", ""))
+            if message:
+                notify(message)
+        elif kind == "routine":
+            log.info("routine %s: %s", event.get("name"), event.get("prompt"))
 
     client.event.connect(on_event)
 
@@ -315,13 +454,12 @@ def run(start_hidden: bool | None = None) -> int:
     if config.get("ui.tray", True) and QSystemTrayIcon.isSystemTrayAvailable():
         tray = QSystemTrayIcon(avatar.state_icon("idle", url, accent, name), app)
         tray.setToolTip(f"{name} — starting")
-        menu = _build_menu(app, window, client, config, orb, open_settings)
-        tray.setContextMenu(menu)
-        tray.activated.connect(
-            lambda reason: window.toggle_visible()
-            if reason == QSystemTrayIcon.ActivationReason.Trigger else None)
-        tray.show()
+        menu = _build_menu(app, window, client, config, orb, open_settings,
+                           lambda: current["state"])
         menu.setStyleSheet(window.styleSheet())
+        tray.setContextMenu(menu)
+        tray.activated.connect(lambda reason: _tray_clicked(reason, window))
+        tray.show()
 
     def notify(message: str) -> None:
         """The one way to reach the user that Wayland never refuses."""

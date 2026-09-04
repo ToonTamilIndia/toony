@@ -30,34 +30,55 @@ def can_see(provider: str, model: str) -> bool:
     return any(hint in lowered for hint in VISION_HINTS)
 
 
-def build_brain(cfg: Config) -> Brain:
-    provider = str(cfg.get("brain.provider", "ollama")).lower()
+def build_one(cfg: Config, provider: str, model: str = "",
+              name: str = "") -> Brain:
+    """One backend, named explicitly. Everything else here goes through this.
+
+    ``model`` empty means "whatever the config says for this provider", which
+    is the ordinary case; the router passes one in when it has resolved a
+    better model than the config names.
+    """
+    provider = provider.lower()
     if provider not in PROVIDERS:
         raise BrainError(f"Unknown brain provider {provider!r}. "
                          f"Choose one of: {', '.join(PROVIDERS)}")
+    sec = cfg.section(f"brain.{provider}")
+    model = model or str(sec.get("model", ""))
 
     if provider == "claude":
         from .claude import ClaudeBrain
-        sec = cfg.section("brain.claude")
-        return ClaudeBrain(
-            model=sec["model"],
+        brain = ClaudeBrain(
+            model=model,
             api_key=cfg.api_key("brain.claude"),
             max_tokens=int(sec["max_tokens"]),
             effort=sec["effort"],
             thinking=sec["thinking"],
             refusal_fallback=bool(sec["refusal_fallback"]),
         )
+    else:
+        from .openai_compat import OpenAICompatBrain
+        brain = OpenAICompatBrain(
+            model=model,
+            base_url=sec["base_url"],
+            api_key=cfg.api_key(f"brain.{provider}"),
+            max_tokens=int(sec["max_tokens"]),
+            temperature=float(cfg.get("brain.temperature", 0.5)),
+            name=name or provider,
+        )
+    if name:
+        brain.name = name
+    return brain
 
-    from .openai_compat import OpenAICompatBrain
-    sec = cfg.section(f"brain.{provider}")
-    return OpenAICompatBrain(
-        model=sec["model"],
-        base_url=sec["base_url"],
-        api_key=cfg.api_key(f"brain.{provider}"),
-        max_tokens=int(sec["max_tokens"]),
-        temperature=float(cfg.get("brain.temperature", 0.5)),
-        name=provider,
-    )
+
+def build_brain(cfg: Config) -> Brain:
+    """The configured brain on its own, with no failover.
+
+    Most callers want :func:`toony.brain.router.build` instead, which wraps
+    this in the fallback chain. This stays for the places that genuinely want
+    exactly what the config names — ``toony doctor``, and the router itself.
+    """
+    provider = str(cfg.get("brain.provider", "ollama")).lower()
+    return build_one(cfg, provider)
 
 
 def build_vision(cfg: Config) -> Brain:
@@ -85,26 +106,28 @@ def build_vision(cfg: Config) -> Brain:
         raise BrainError(f"Unknown vision provider {provider!r}. "
                          f"Choose one of: auto, brain, {', '.join(PROVIDERS)}")
 
-    model = (str(cfg.get("vision.model", "")).strip()
-             or DEFAULT_VISION_MODEL.get(provider, ""))
+    model = str(cfg.get("vision.model", "")).strip() or _default_vision(cfg, provider)
     if provider == brain_provider and model == brain_model:
         return build_brain(cfg)
 
-    if provider == "claude":
-        from .claude import ClaudeBrain
-        sec = cfg.section("brain.claude")
-        return ClaudeBrain(model=model, api_key=cfg.api_key("brain.claude"),
-                           max_tokens=int(sec["max_tokens"]), effort=sec["effort"],
-                           thinking=sec["thinking"],
-                           refusal_fallback=bool(sec["refusal_fallback"]))
+    return build_one(cfg, provider, model, name=f"{provider}-vision")
 
-    from .openai_compat import OpenAICompatBrain
-    sec = cfg.section(f"brain.{provider}")
-    return OpenAICompatBrain(model=model, base_url=sec["base_url"],
-                             api_key=cfg.api_key(f"brain.{provider}"),
-                             max_tokens=int(sec["max_tokens"]),
-                             temperature=float(cfg.get("brain.temperature", 0.5)),
-                             name=f"{provider}-vision")
+
+def _default_vision(cfg: Config, provider: str) -> str:
+    """The vision model to use when none was named.
+
+    For Ollama that means looking at what is actually installed: naming a model
+    nobody pulled produces a 404 the first time somebody asks what is on their
+    screen, which is the worst moment to find out.
+    """
+    fallback = DEFAULT_VISION_MODEL.get(provider, "")
+    if provider != "ollama" or not cfg.get("brain.auto_model", True):
+        return fallback
+    from .discovery import best_local_vision, ollama_models
+
+    installed = ollama_models(str(cfg.get("brain.ollama.base_url",
+                                          "http://localhost:11434/v1")))
+    return best_local_vision(installed) or fallback
 
 
 def vision_summary(cfg: Config) -> str:

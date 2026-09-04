@@ -103,8 +103,11 @@ toony use claude --model claude-opus-5
 ```
 
 Each preset sets the brain, the ears, the voice and the vision model together,
-then reloads the running daemon. `toony use` on its own prints the stack and
-tells you if the API key it needs is missing.
+then reloads the running daemon. `toony use` on its own prints the stack, the
+fallback chain behind it, and tells you if the API key it needs is missing.
+
+Choosing the cloud does not mean losing the local one: see
+[When the good model is not there](#when-the-good-model-is-not-there).
 
 ## Personality
 
@@ -206,6 +209,44 @@ toony config set wakeword.similarity 0.65    # looser
 `toony ask` works whether or not the daemon is running — without it, it builds a
 one-shot assistant in the foreground. Either way it continues the conversation
 you were already having, so follow-up questions work.
+
+### Push-to-talk
+
+Three things used to sit between pressing the key and being heard, and all
+three are gone.
+
+**The microphone stays open.** Opening a PortAudio stream costs between fifty
+and four hundred milliseconds depending on what PipeWire is doing, and paying
+that *after* the key press means the microphone starts listening after you have
+started talking. It is opened once now and held; after `audio.stream_idle_s`
+unused it is handed back, so the recording indicator goes away and other
+applications can have it.
+
+**The last 700ms are always kept.** Even with the stream open there is a gap —
+the key press travels through the compositor, a socket and a thread. So a ring
+buffer holds the audio from *before* the press and recording starts from there.
+This is the whole reason the first syllable is now reliably there. Only the
+part with speech in it is used; a second of room tone in front of a sentence is
+something the decoder will happily hallucinate words out of.
+
+**The key is read directly.** A KDE global shortcut runs a command when the
+combination goes down and tells nobody when it comes up. There is no release
+event to be had, so hold-to-talk cannot be built on it at all — and the round
+trip costs sixty to a hundred and fifty milliseconds. Reading
+`/dev/input/event*` gives both edges in about ten. It needs to be allowed to:
+
+```bash
+toony ptt              # what is set up, and what it costs
+toony ptt --setup      # what to run if the permission is missing
+toony ptt --watch      # press the key and watch it be seen
+toony ptt --mode hold  # hold to talk, release to send
+```
+
+Without the permission everything still works through the KDE shortcut, just
+slower and without hold mode — and `toony ptt` says exactly that rather than
+leaving you guessing. A quick double tap cancels the turn instead of sending
+it, which is the recovery for hitting the key by accident.
+
 
 ## The orb
 
@@ -498,7 +539,22 @@ a screen produces things a synthesiser reads out letter by letter:
 
 ## Speed
 
-Two settings account for most of the wait.
+Most of the wait is not the model thinking. It is the model not being there,
+the microphone not being open yet, and work repeated on every single turn.
+
+**The local model is kept loaded.** Ollama drops a model out of memory five
+minutes after the last request, so the first question after a coffee break
+spends ten to twenty seconds reading five gigabytes onto the GPU before it
+starts. Asking twice in a row feels fine, which is exactly why this survives
+being investigated. Toony pushes that timer back for as long as you are using
+it, and stops when you are not — so an afternoon of questions is fast
+throughout and the card is free overnight.
+
+```bash
+toony models                                   # what is loaded right now
+toony config set brain.ollama.keep_alive 30m
+toony config set brain.ollama.keep_warm_minutes 90   # then let it go
+```
 
 **Speaking starts at the first word**, not when the whole reply is finished.
 On a local model that is the difference between half a second and thirty
@@ -513,14 +569,91 @@ battery and the time" is one round trip, not three. Anything that asks
 permission or writes a file still runs one at a time — two spoken permission
 questions at once is not a conversation.
 
+**Whisper is sized to what runs it.** `stt.local.model = auto` loads `small` on
+the GPU and `base.en` without one, because whisper is about twenty times
+slower on a CPU and `small` there is ten seconds of silence after every
+sentence. If the GPU quietly fell back — a missing cuDNN will do it — `toony
+doctor` says so instead of leaving you to wonder.
+
+**The per-turn work is cached.** The tool list, the JSON schemas sent to the
+model, and the `PATH` lookups that decide which tools exist were all being
+recomputed for every question. They change when the configuration does, and
+that is when they are recomputed now.
+
 ```bash
 toony config set brain.stream_from_start true    # the default
 toony config set brain.parallel_tools true       # the default
 toony config set tools.max_parallel 4
 ```
 
-If answers themselves are slow, that is the model. `toony use hybrid` moves the
-brain to Claude and keeps speech local.
+`toony doctor` has a **speed** section that reports all of it: whether a model
+is resident, whether the keyboard is being read directly, whether the
+microphone pre-roll is on.
+
+## When the good model is not there
+
+Picking Claude on a laptop should not mean silence on a train. Toony keeps an
+ordered list of backends and uses the first one that works:
+
+```
+claude:claude-opus-5 -> ollama:qwen2.5:7b
+```
+
+A backend that fails a *transport* failure — no connection, a timeout, a rate
+limit, a 5xx — is rested and the next one answers. The cooldown doubles each
+time, so a provider that is properly gone stops costing a timeout on every
+question, and the moment it works again it is used again. No restart, no
+setting to change, and a notification saying which model actually answered.
+
+Two things deliberately do **not** fail over. A rejected transcript is raised,
+because every backend would reject it the same way and the agent already knows
+how to recover. And a stream that has already spoken a word is never retried
+elsewhere — otherwise you hear half of one answer followed by all of another.
+
+```bash
+toony models                    # what is usable, best first
+toony models --auto             # switch to the best available
+toony models --pull qwen2.5:7b  # get a local one as a backstop
+toony config set brain.fallback off             # only what you chose
+toony config set brain.fallback '["claude", "ollama"]'
+```
+
+Model names are checked too. With `brain.auto_model` on (the default), a model
+named in the config but never pulled is replaced by the best one that *was*
+pulled, rather than failing with "model not found" on every question.
+
+## Routines
+
+Things Toony does without being asked. A routine is a trigger and a prompt, and
+the prompt goes through the ordinary agent — so a routine can do exactly what
+you could have asked for out loud and no more, and anything that would have
+asked permission still asks.
+
+```bash
+toony routine add "morning"  "at 08:30"        "anything wrong with this machine overnight?"
+toony routine add "updates"  "every 6h"        "check for updates, do not install them"
+toony routine add "battery"  "on battery_low"  "tell me the battery is low, one sentence"
+toony routine                                  # list them, with when each is next due
+toony routine run morning                      # now, without waiting
+toony routine disable updates
+```
+
+| trigger | when |
+|---|---|
+| `at 08:30` | daily, optionally only on some days |
+| `every 30m` | repeating, from when the daemon started |
+| `on startup` | shortly after the daemon comes up |
+| `on network_up` / `on network_down` | the connection came back, or went |
+| `on battery_low` | crossing `automation.battery_low_percent`, on battery |
+
+Events fire on the edge: a battery at 12% warns once when it crosses the line,
+not every thirty seconds all afternoon.
+
+```bash
+toony config set automation.quiet_hours 22:30-07:30
+```
+
+Routines still run during quiet hours. They just do not speak.
 
 ## Configuration
 
@@ -590,10 +723,15 @@ toony/
 ├── cli.py            every `toony` subcommand
 ├── history.py        conversations on disk: save, list, reopen, prune
 ├── text.py           making written text worth listening to
+├── net.py            one cached answer to "are we online?"
+├── automation.py     routines: triggers, scheduler, battery and network watch
 ├── bridges/          telegram: long polling, pairing, backlog limits
 ├── ui/               orb, tray, window, settings, avatar, event client
-├── audio/            devices, capture with endpointing, VAD, playback, wake word
+├── audio/            devices, capture with pre-roll, VAD, playback, wake word,
+│                     hotkey (reading /dev/input for press *and* release)
 ├── brain/            claude · openai_compat (also Ollama) · prompts
+│                     router (failover) · discovery (what is installed)
+│                     ollama (keeping the model loaded)
 ├── stt/              local_whisper · cloud_whisper
 ├── tts/              piper · espeak · cloud · the sentence-streaming speaker
 └── tools/            applications, system, logs, power, network, packages,
@@ -611,10 +749,12 @@ python3 -m unittest discover -s tests -v
 ```
 
 The tests cover the agent loop, the permission gate and its per-tool overrides,
-config typing, audio conversion and endpointing, sentence chunking, conversation
-storage, spoken-duration parsing, the sudo allowlist, shortcut matching, and the
-whole control socket including the event stream and click-to-confirm — all with
-fakes, so they need no microphone, no GPU and no network.
+config typing, audio conversion and endpointing, microphone pre-roll, sentence
+chunking, conversation storage, spoken-duration parsing, the sudo allowlist,
+shortcut matching, hotkey parsing, model ranking, routine triggers and their
+scheduler, the whole failover path — including the two cases that must *not*
+fail over — and the control socket with its event stream and click-to-confirm.
+All with fakes, so they need no microphone, no GPU and no network.
 
 ## Troubleshooting
 
@@ -622,9 +762,24 @@ fakes, so they need no microphone, no GPU and no network.
 cuts you off, raise `audio.silence_ms`. If it never stops, lower
 `audio.energy_threshold` or switch `audio.vad` to `webrtc`.
 
-**It answers slowly.** `brain.claude.effort low`, a smaller Whisper model, and
-`tts.stream true`. Check where the time goes with `toony logs -f` — every stage
-logs its duration.
+**It answers slowly.** Run `toony doctor` and read the **speed** section first;
+it usually says which of the three it is. The most common answer is that the
+local model is not loaded — `toony models` shows what is resident, and
+`brain.ollama.keep_warm` keeps it that way. After that: `brain.claude.effort
+low`, `stt.local.model auto`, and `tts.stream true`. Check where the time
+actually goes with `toony logs -f` — every stage logs its duration.
+
+**It misses the first word.** `toony ptt`. If the pre-roll is 0 turn it back
+on; if push-to-talk is going through the KDE shortcut rather than reading the
+keyboard, `toony ptt --setup` says what to run.
+
+**Hold-to-talk does nothing when I let go.** A KDE global shortcut has no
+key-release event, so hold mode needs the evdev engine: `toony ptt --setup`,
+then `toony ptt --mode hold`. Or stay on `--mode toggle`.
+
+**It said the local model answered.** It did — the cloud one could not be
+reached. `toony status` names what is answering right now and why the other one
+is resting.
 
 **The hotkey does nothing.** `toony shortcut --status` — it checks the launcher
 entry, the binding, conflicts, kglobalacceld and the daemon, and names whichever

@@ -106,11 +106,32 @@ class Tool:
 class Registry:
     def __init__(self) -> None:
         self._tools: dict[str, Tool] = {}
+        # The enabled set and the specs derived from it are recomputed on every
+        # turn otherwise, and neither changes unless the configuration does.
+        self._enabled_cache: dict[tuple, list[Tool]] = {}
+        self._spec_cache: dict[tuple, list] = {}
 
     def add(self, tool_obj: Tool) -> None:
         if tool_obj.name in self._tools:
             raise ValueError(f"duplicate tool name: {tool_obj.name}")
         self._tools[tool_obj.name] = tool_obj
+        self.forget()
+
+    def forget(self) -> None:
+        """Drop the caches — after a config reload, or a new tool."""
+        self._enabled_cache.clear()
+        self._spec_cache.clear()
+
+    @staticmethod
+    def _fingerprint(config) -> tuple:
+        """The parts of the configuration that change which tools exist."""
+        if config is None:
+            return ()
+        return (
+            tuple(config.get("tools.enabled", ["*"]) or []),
+            tuple(config.get("tools.disabled", []) or []),
+            bool(config.get("tools.shell.enabled", False)),
+        )
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
@@ -165,6 +186,10 @@ class Registry:
 
     def enabled(self, config) -> list[Tool]:
         """Apply the enabled/disabled lists and drop tools whose binary is absent."""
+        key = self._fingerprint(config)
+        cached = self._enabled_cache.get(key)
+        if cached is not None:
+            return cached
         allowed = config.get("tools.enabled", ["*"]) or []
         blocked = set(config.get("tools.disabled", []) or [])
         shell_on = bool(config.get("tools.shell.enabled", False))
@@ -180,11 +205,20 @@ class Registry:
                 log.debug("tool %s unavailable (missing %s)", t.name, t.missing())
                 continue
             out.append(t)
+        self._enabled_cache[key] = out
         return out
 
     def specs(self, config):
+        """What the model is told it can do. Cached: this is per-turn."""
+        key = self._fingerprint(config)
+        cached = self._spec_cache.get(key)
+        if cached is not None:
+            return cached
         from ..brain.base import ToolSpec
-        return [ToolSpec(t.name, t.description, t.schema) for t in self.enabled(config)]
+        specs = [ToolSpec(t.name, t.description, t.schema)
+                 for t in self.enabled(config)]
+        self._spec_cache[key] = specs
+        return specs
 
 
 REGISTRY = Registry()

@@ -33,6 +33,11 @@ class LocalWhisper(STT):
         self.initial_prompt = initial_prompt or None
         self._model = None
 
+    # Whisper on a GPU is roughly twenty times faster than on a CPU, so the
+    # model that gives a half-second transcription on a 3050 gives ten seconds
+    # without it. "auto" therefore means a different size on each.
+    AUTO_MODEL = {"cuda": "small", "cpu": "base.en"}
+
     def _load(self):
         if self._model is not None:
             return self._model
@@ -45,6 +50,7 @@ class LocalWhisper(STT):
             ) from exc
 
         device, compute = self._pick_device()
+        self.model_name = self._pick_model(device)
         if device == "cuda":
             from . import cuda
 
@@ -59,12 +65,24 @@ class LocalWhisper(STT):
                 # A missing cuDNN or too little VRAM should not be fatal.
                 log.warning("CUDA load failed (%s) — falling back to CPU", exc)
                 self.device, self.compute_type = "cpu", "int8"
+                self.model_name = self._pick_model("cpu")
                 self._model = WhisperModel(self.model_name, device="cpu",
                                            compute_type="int8")
             else:
                 raise STTError(f"could not load whisper {self.model_name}: {exc}") from exc
         log.info("whisper ready in %.1fs", time.monotonic() - started)
         return self._model
+
+    def _pick_model(self, device: str) -> str:
+        """Which size to load. "auto" fits the size to what will run it."""
+        if self.model_name != "auto":
+            return self.model_name
+        chosen = self.AUTO_MODEL.get(device, "base.en")
+        if device != "cuda":
+            log.info("no usable GPU — using whisper %s, which is about five "
+                     "times faster on a CPU than 'small' (set stt.local.model "
+                     "to override)", chosen)
+        return chosen
 
     def _pick_device(self) -> tuple[str, str]:
         from . import cuda
@@ -86,6 +104,7 @@ class LocalWhisper(STT):
         log.error("GPU transcription failed: %s", reason)
         log.error("%s", cuda.advice() or "falling back to the CPU")
         self.device, self.compute_type = "cpu", "int8"
+        self.model_name = self._pick_model("cpu")
         self._model = WhisperModel(self.model_name, device="cpu",
                                    compute_type="int8")
         log.info("whisper is now running on the CPU")

@@ -319,5 +319,151 @@ class TestSettingsHints(unittest.TestCase):
                 self.assertTrue(key.endswith(self.settings._SECRET))
 
 
+class TestContrastOnTheAccent(unittest.TestCase):
+    """The accent is the user's to choose, so nothing may assume it is dark.
+
+    A hardcoded white label on a pale accent is how the Send button and the
+    settings Save button became unreadable, so the foreground is derived.
+    """
+
+    def setUp(self):
+        from toony.ui import theme
+
+        self.theme = theme
+
+    def test_a_dark_accent_takes_a_light_label(self):
+        for accent in ("#7c5cff", "#1f2a44", "#000000", "#c0392b"):
+            with self.subTest(accent=accent):
+                self.assertEqual(self.theme.contrast_on(accent), "#ffffff")
+
+    def test_a_pale_accent_takes_a_dark_label(self):
+        for accent in ("#ffe066", "#ffffff", "#7ef9c0", "#e8e8f0"):
+            with self.subTest(accent=accent):
+                self.assertEqual(self.theme.contrast_on(accent), "#12121a")
+
+    def test_the_sheet_puts_that_colour_on_every_accent_button(self):
+        sheet = self.theme.stylesheet("dark", accent="#ffe066")
+        # Anything painted with the accent must name the dark foreground; a
+        # white one would vanish on this accent.
+        for rule in ("QPushButton#primary", "QPushButton#mic",
+                     "QPushButton#send", "QPushButton:default"):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, sheet)
+        self.assertIn("#12121a", sheet)
+
+    def test_nonsense_colours_do_not_raise(self):
+        self.assertIsNone(self.theme.channels("chartreuse"))
+        self.assertEqual(self.theme.mix("nope", "#ffffff", 0.5), "nope")
+        self.assertIsInstance(self.theme.contrast_on("nope"), str)
+
+    def test_mixing_moves_toward_the_second_colour(self):
+        self.assertEqual(self.theme.mix("#000000", "#ffffff", 0.0), "#000000")
+        self.assertEqual(self.theme.mix("#000000", "#ffffff", 1.0), "#ffffff")
+        self.assertEqual(self.theme.mix("#000000", "#ffffff", 0.5), "#808080")
+
+    def test_an_out_of_range_amount_is_clamped(self):
+        self.assertEqual(self.theme.mix("#000000", "#ffffff", 5.0), "#ffffff")
+        self.assertEqual(self.theme.mix("#000000", "#ffffff", -2.0), "#000000")
+
+
+class TestIcons(unittest.TestCase):
+    """Buttons are drawn, not typed: an emoji ignores the colour it is given."""
+
+    def setUp(self):
+        import tempfile
+
+        from toony.ui import icons
+
+        self.icons = icons
+        self.previous = icons.ICON_DIR
+        icons.ICON_DIR = pathlib_path(tempfile.mkdtemp()) / "icons"
+        icons._paths.clear()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        self.icons.ICON_DIR = self.previous
+        self.icons._paths.clear()
+
+    def test_every_shape_renders_as_svg_in_the_colour_asked_for(self):
+        for name in self.icons.SHAPES:
+            with self.subTest(shape=name):
+                text = self.icons.source(name, "#abcdef")
+                self.assertTrue(text.startswith("<svg"))
+                self.assertTrue(text.endswith("</svg>"))
+                self.assertIn("#abcdef", text)
+                self.assertNotIn("{colour}", text)
+
+    def test_the_buttons_the_window_asks_for_all_exist(self):
+        for name in ("mic", "stop", "send", "pin", "pin_off", "menu", "new",
+                     "settings", "minimise", "close", "check", "dash", "dot",
+                     "chevron_down", "chevron_right"):
+            with self.subTest(shape=name):
+                self.assertIn(name, self.icons.SHAPES)
+
+    def test_a_shape_is_written_once_and_reused(self):
+        first = self.icons.path("check", "#ffffff")
+        self.assertIsNotNone(first)
+        self.assertTrue(pathlib_path(first).is_file())
+        self.assertEqual(self.icons.path("check", "#ffffff"), first)
+
+    def test_a_different_colour_is_a_different_file(self):
+        self.assertNotEqual(self.icons.path("check", "#ffffff"),
+                            self.icons.path("check", "#000000"))
+
+    def test_an_unknown_shape_is_nothing_rather_than_a_broken_path(self):
+        """A stylesheet pointing at a missing file draws an empty box."""
+        self.assertIsNone(self.icons.source("teapot", "#ffffff"))
+        self.assertIsNone(self.icons.path("teapot", "#ffffff"))
+        self.assertEqual(self.icons.css("image", "teapot", "#ffffff"), "")
+
+    def test_css_names_a_file_that_is_really_there(self):
+        rule = self.icons.css("image", "check", "#ffffff")
+        self.assertTrue(rule.startswith("image: url("))
+        inside = rule[len("image: url("):].rstrip(");")
+        self.assertTrue(pathlib_path(inside).is_file())
+
+
+class TestIndicatorsAreDrawn(unittest.TestCase):
+    """Styling an indicator makes Qt stop drawing the native tick.
+
+    So a checked box has to carry its own, or it is a blue square with nothing
+    in it — which is exactly how the checkboxes looked.
+    """
+
+    def setUp(self):
+        from toony.ui import theme
+
+        self.theme = theme
+
+    def test_a_checked_box_is_given_a_tick(self):
+        sheet = self.theme.stylesheet("dark")
+        self.assertIn("QCheckBox::indicator:checked", sheet)
+        checked = sheet.split("QCheckBox::indicator:checked", 1)[1].split("}", 1)[0]
+        self.assertIn("image: url(", checked)
+        self.assertIn("check-", checked)
+
+    def test_a_checked_menu_item_is_given_one_too(self):
+        sheet = self.theme.stylesheet("dark")
+        self.assertIn("QMenu::indicator", sheet)
+        self.assertIn("QMenu::indicator:checked", sheet)
+
+    def test_indicators_are_left_alone_when_there_is_no_artwork(self):
+        """Better the platform's own tick than a square with nothing in it."""
+        colours = self.theme.palette("dark")
+        original = self.theme.icons.css
+        self.theme.icons.css = lambda *a, **k: ""
+        try:
+            rules = self.theme._indicators(colours)
+        finally:
+            self.theme.icons.css = original
+        self.assertNotIn("QCheckBox::indicator", rules)
+
+
+def pathlib_path(value):
+    from pathlib import Path
+
+    return Path(value)
+
+
 if __name__ == "__main__":
     unittest.main()

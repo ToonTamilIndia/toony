@@ -15,6 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from toony import ipc
 from toony.agent import Agent
 from toony.app import Assistant
+from toony.audio.capture import MicrophonePool
+from toony.automation import Scheduler, Watcher
+from toony.brain.ollama import WarmKeeper
 from toony.brain.base import Brain, BrainReply, ToolCall
 from toony.config import Config
 from toony.history import Store
@@ -68,8 +71,17 @@ def build_assistant(replies=None, store=None):
     assistant._turn_lock = threading.Lock()
     assistant._pending = {}
     assistant._interrupted = False
+    assistant._requested_at = 0.0
+    assistant._from_barge_in = False
+    assistant._last_tap = 0.0
+    assistant._key_down = False
     assistant.telegram = None
     assistant._chat_conversations = {}
+    assistant.mics = MicrophonePool(config)
+    assistant.hotkey = None
+    assistant.warmer = WarmKeeper(config)
+    assistant.routines = Scheduler(config, assistant._run_routine)
+    assistant.watcher = Watcher(config, assistant.routines.fire)
     assistant._server = ipc.ControlServer(assistant._handle)
     return assistant
 
@@ -91,8 +103,11 @@ class TestControlSocket(unittest.TestCase):
     def test_status_reports_the_configured_stack(self):
         reply = ipc.send("status", timeout=5)
         self.assertTrue(reply["ok"])
-        self.assertEqual(reply["brain"], "ollama:qwen2.5:7b")
+        self.assertEqual(reply["brain_configured"], "ollama:qwen2.5:7b")
         self.assertFalse(reply["wakeword"])
+        # No routing block when there is only one backend to talk to.
+        self.assertIsNone(reply["routing"])
+        self.assertEqual(reply["ptt"]["mode"], "toggle")
 
     def test_ask_runs_the_tool_loop_and_speaks(self):
         reply = ipc.send("ask", text="what time is it", speak=True, timeout=30)

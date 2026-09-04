@@ -8,7 +8,7 @@ import urllib.parse
 import urllib.request
 
 from ..log import get
-from .proc import CommandError, any_of, spawn
+from .proc import CommandError, any_of, launch, which
 from .registry import ToolContext, tool
 
 log = get("tools.web")
@@ -60,15 +60,30 @@ def search_web(ctx: ToolContext, query: str, limit: int = 5) -> str:
 def open_url(ctx: ToolContext, url: str) -> str:
     if not re.match(r"^https?://", url):
         url = "https://" + url
+    host = urllib.parse.urlparse(url).netloc
+
     browser = ""
     if ctx.config:
         browser = str(ctx.config.get("tools.web.browser", "") or "")
-    opener = browser or any_of("xdg-open", "kde-open6", "kde-open")
-    if not opener:
-        raise CommandError("no browser opener found")
-    spawn([opener, url])
-    host = urllib.parse.urlparse(url).netloc
-    return f"Opened {host} in your browser."
+    # Each opener in turn, because one being installed is no promise that it
+    # works: xdg-open on a session with no default browser set exits non-zero
+    # and opens nothing, and kde-open is right there.
+    openers = [browser] if browser else []
+    openers += [o for o in ("xdg-open", "kde-open6", "kde-open", "gio")
+                if which(o)]
+    if not openers:
+        raise CommandError("nothing on this machine knows how to open a link")
+
+    reasons = []
+    for opener in openers:
+        argv = [opener, "open", url] if opener.endswith("gio") else [opener, url]
+        try:
+            launch(argv, f"{host} in your browser")
+            return f"Opened {host} in your browser."
+        except CommandError as exc:
+            log.info("%s could not open %s: %s", opener, host, exc)
+            reasons.append(str(exc))
+    raise CommandError(f"I could not open {host}. {reasons[-1]}")
 
 
 @tool(description="Search the web in a browser window instead of reading results "

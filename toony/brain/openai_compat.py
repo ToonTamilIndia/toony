@@ -38,6 +38,11 @@ class OpenAICompatBrain(Brain):
         self.name = name
         # api.openai.com renamed the field on newer models; discovered on first 400.
         self._token_param = "max_tokens"
+        # The tool list is the same sixty schemas on every single turn, and
+        # rebuilding it is pure work. Keyed by identity because the registry
+        # hands back the same cached list until the configuration changes.
+        self._tools_key: int = 0
+        self._tools_payload: list[dict[str, Any]] = []
 
     # ---- transcript translation -------------------------------------------
     @staticmethod
@@ -93,9 +98,16 @@ class OpenAICompatBrain(Brain):
             self._token_param: self.max_tokens,
         }
         if tools:
-            params["tools"] = [t.to_openai() for t in tools]
+            params["tools"] = self._tool_payload(tools)
             params["tool_choice"] = "auto"
         return params
+
+    def _tool_payload(self, tools: list[ToolSpec]) -> list[dict[str, Any]]:
+        key = id(tools)
+        if key != self._tools_key or len(self._tools_payload) != len(tools):
+            self._tools_payload = [t.to_openai() for t in tools]
+            self._tools_key = key
+        return self._tools_payload
 
     def _create(self, params: dict[str, Any], stream: bool = False):
         try:

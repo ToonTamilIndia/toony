@@ -3,9 +3,17 @@
 Two palettes, one sheet. ``auto`` asks Qt what the desktop is doing, which on
 Plasma means Toony follows the system Breeze light/dark setting without being
 told about it.
+
+The accent is chosen by the user and may be anything, so nothing here hardcodes
+what goes *on* the accent: :func:`contrast_on` picks black or white per accent,
+and every rule that paints the accent as a background uses it. That is what
+stops a pale accent swallowing white button text, and a dark one swallowing
+black.
 """
 
 from __future__ import annotations
+
+from . import icons
 
 DARK = {
     "bg": "#16161d",
@@ -68,22 +76,138 @@ def resolve(mode: str) -> str:
     return "dark"
 
 
+# ---- colour arithmetic ----------------------------------------------------
+
+def channels(colour: str) -> tuple[int, int, int] | None:
+    """(r, g, b) from #rgb or #rrggbb, or None if it is not a hex colour."""
+    text = colour.strip().lstrip("#")
+    if len(text) == 3:
+        text = "".join(c * 2 for c in text)
+    if len(text) != 6:
+        return None
+    try:
+        return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))  # type: ignore
+    except ValueError:
+        return None
+
+
+def luminance(colour: str) -> float:
+    """WCAG relative luminance, 0 (black) to 1 (white)."""
+    rgb = channels(colour)
+    if rgb is None:
+        return 0.5
+    parts = []
+    for value in rgb:
+        fraction = value / 255.0
+        parts.append(fraction / 12.92 if fraction <= 0.04045
+                     else ((fraction + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * parts[0] + 0.7152 * parts[1] + 0.0722 * parts[2]
+
+
+def contrast_on(colour: str) -> str:
+    """The readable foreground for text sitting on ``colour``.
+
+    0.42 rather than 0.5: black on a mid colour reads better than white does,
+    so the switch to white happens a little later than the midpoint.
+    """
+    return "#12121a" if luminance(colour) > 0.42 else "#ffffff"
+
+
+def mix(first: str, second: str, amount: float) -> str:
+    """``amount`` of the way from ``first`` to ``second``."""
+    one, two = channels(first), channels(second)
+    if one is None or two is None:
+        return first
+    amount = min(1.0, max(0.0, amount))
+    blend = tuple(round(a + (b - a) * amount) for a, b in zip(one, two))
+    return "#%02x%02x%02x" % blend
+
+
 def palette(mode: str, accent: str = "#7c5cff") -> dict[str, str]:
     colours = dict(DARK if resolve(mode) == "dark" else LIGHT)
     colours["accent"] = accent
+    # Everything that lands on top of the accent, derived from the accent
+    # itself so a user-chosen colour can never make its own labels vanish.
+    colours["on_accent"] = contrast_on(accent)
+    colours["accent_hover"] = mix(accent, "#ffffff", 0.16)
+    colours["accent_press"] = mix(accent, "#000000", 0.16)
+    # A tint of the accent, for the "this toggle is on" background.
+    colours["accent_soft"] = mix(colours["panel"], accent, 0.26)
+    colours["on_danger"] = contrast_on(colours["danger"])
     return colours
 
 
 def rgba(colour: str, alpha: float) -> str:
     """#rrggbb plus an alpha, as CSS. Qt stylesheets understand rgba()."""
-    text = colour.lstrip("#")
-    if len(text) == 3:
-        text = "".join(c * 2 for c in text)
-    try:
-        red, green, blue = (int(text[i:i + 2], 16) for i in (0, 2, 4))
-    except (ValueError, IndexError):
+    rgb = channels(colour)
+    if rgb is None:
         return colour
+    red, green, blue = rgb
     return f"rgba({red}, {green}, {blue}, {min(1.0, max(0.0, alpha)):.3f})"
+
+
+# ---- the parts of the sheet that need artwork -----------------------------
+
+def _indicators(c: dict[str, str]) -> str:
+    """Checkbox, radio and menu ticks.
+
+    Qt drops the native tick as soon as a stylesheet styles an indicator, so
+    these rules are all-or-nothing: without the artwork we style nothing and
+    let the platform draw its own, rather than leaving a blue square with no
+    mark in it.
+    """
+    tick_on_accent = icons.css("image", "check", c["on_accent"])
+    tick_on_panel = icons.css("image", "check", c["text"])
+    dash = icons.css("image", "dash", c["on_accent"])
+    dot = icons.css("image", "dot", c["on_accent"])
+    if not (tick_on_accent and tick_on_panel):
+        return "/* no icon cache — leaving indicators to the native style */"
+    return f"""
+QCheckBox, QRadioButton {{ spacing: 8px; background: transparent; }}
+QCheckBox::indicator, QRadioButton::indicator {{
+    width: 18px; height: 18px;
+    border: 1px solid {c['border']};
+    background: {c['panel']};
+}}
+QCheckBox::indicator {{ border-radius: 5px; }}
+QRadioButton::indicator {{ border-radius: 9px; }}
+QCheckBox::indicator:hover, QRadioButton::indicator:hover {{
+    border-color: {c['accent']};
+}}
+QCheckBox::indicator:checked {{
+    background: {c['accent']}; border-color: {c['accent']}; {tick_on_accent}
+}}
+QCheckBox::indicator:indeterminate {{
+    background: {c['accent']}; border-color: {c['accent']}; {dash}
+}}
+QRadioButton::indicator:checked {{
+    background: {c['accent']}; border-color: {c['accent']}; {dot}
+}}
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled {{
+    background: {c['raised']}; border-color: {c['border']};
+}}
+QMenu::indicator {{ width: 16px; height: 16px; left: 10px; }}
+QMenu::indicator:checked, QMenu::indicator:non-exclusive:checked,
+QMenu::indicator:exclusive:checked {{ {tick_on_panel} }}
+QMenu::indicator:checked:selected,
+QMenu::indicator:non-exclusive:checked:selected,
+QMenu::indicator:exclusive:checked:selected {{ {tick_on_accent} }}
+"""
+
+
+def _arrows(c: dict[str, str]) -> str:
+    """Combo box and submenu arrows, in a colour that suits the palette."""
+    down = icons.css("image", "chevron_down", c["muted"])
+    right = icons.css("image", "chevron_right", c["muted"])
+    right_selected = icons.css("image", "chevron_right", c["on_accent"])
+    if not (down and right):
+        return ""
+    return f"""
+QComboBox::drop-down {{ border: none; width: 24px; }}
+QComboBox::down-arrow {{ width: 12px; height: 12px; {down} }}
+QMenu::right-arrow {{ width: 12px; height: 12px; margin-right: 8px; {right} }}
+QMenu::right-arrow:selected {{ {right_selected} }}
+"""
 
 
 def stylesheet(mode: str, accent: str = "#7c5cff", font_size: int = 14,
@@ -100,6 +224,8 @@ def stylesheet(mode: str, accent: str = "#7c5cff", font_size: int = 14,
     if opacity < 0.999:
         for key in ("bg", "panel", "raised"):
             c[key] = rgba(c[key], opacity)
+    c["indicators"] = _indicators(c)
+    c["arrows"] = _arrows(c)
     return _SHEET.format(**c)
 
 
@@ -128,22 +254,49 @@ QPushButton {{
     border-radius: 8px;
     padding: 6px 12px;
 }}
-QPushButton:hover  {{ background: {accent}; color: #ffffff; border-color: {accent}; }}
-QPushButton:pressed{{ background: {accent}; }}
-QPushButton:disabled {{ color: {muted}; background: {panel}; }}
+QPushButton:hover {{
+    background: {accent_hover}; color: {on_accent}; border-color: {accent_hover};
+}}
+QPushButton:pressed {{
+    background: {accent_press}; color: {on_accent}; border-color: {accent_press};
+}}
+QPushButton:disabled {{
+    color: {muted}; background: {panel}; border-color: {border};
+}}
 QPushButton#icon {{
-    background: transparent; border: none; padding: 4px 8px; font-size: {font_size}px;
+    background: transparent; border: none; padding: 4px; border-radius: 8px;
 }}
 QPushButton#icon:hover {{ background: {raised}; color: {text}; }}
-QPushButton#primary {{
-    background: {accent}; color: #ffffff; border: none; font-weight: 600;
+QPushButton#icon:pressed {{ background: {border}; color: {text}; }}
+QPushButton#icon:checked {{ background: {accent_soft}; color: {text}; }}
+
+/* Anything painted in the accent takes its foreground from the accent, so a
+   user-chosen colour can never hide its own label. */
+QPushButton#primary, QPushButton#mic, QPushButton#send, QPushButton:default {{
+    background: {accent}; color: {on_accent}; border: 1px solid {accent};
+    font-weight: 600;
 }}
-QPushButton#danger:hover {{ background: {danger}; border-color: {danger}; }}
-QPushButton#mic {{
-    background: {accent}; color: #ffffff; border: none;
-    border-radius: 20px; min-width: 40px; min-height: 40px; font-size: 17px;
+QPushButton#primary:hover, QPushButton#mic:hover, QPushButton#send:hover,
+QPushButton:default:hover {{
+    background: {accent_hover}; border-color: {accent_hover}; color: {on_accent};
 }}
-QPushButton#mic:hover {{ background: {accent}; }}
+QPushButton#primary:pressed, QPushButton#mic:pressed, QPushButton#send:pressed,
+QPushButton:default:pressed {{
+    background: {accent_press}; border-color: {accent_press}; color: {on_accent};
+}}
+QPushButton#primary:disabled, QPushButton#mic:disabled, QPushButton#send:disabled,
+QPushButton:default:disabled {{
+    background: {raised}; color: {muted}; border-color: {border};
+}}
+QPushButton#mic, QPushButton#send {{
+    border-radius: 20px; min-width: 40px; max-width: 40px;
+    min-height: 40px; max-height: 40px; padding: 0;
+}}
+QPushButton#danger {{ color: {danger}; }}
+QPushButton#danger:hover {{
+    background: {danger}; color: {on_danger}; border-color: {danger};
+}}
+QDialogButtonBox QPushButton {{ min-width: 88px; }}
 
 QListWidget {{
     background: {panel};
@@ -153,7 +306,7 @@ QListWidget {{
     padding: 6px;
 }}
 QListWidget::item {{ border-radius: 8px; padding: 8px 10px; margin: 1px 2px; }}
-QListWidget::item:selected {{ background: {accent}; color: #ffffff; }}
+QListWidget::item:selected {{ background: {accent}; color: {on_accent}; }}
 QListWidget::item:hover:!selected {{ background: {raised}; }}
 
 QScrollArea, QScrollArea > QWidget > QWidget {{ background: {bg}; border: none; }}
@@ -177,6 +330,7 @@ QLabel#bubbleTool {{
 QTextEdit#composer, QLineEdit {{
     background: {panel}; border: 1px solid {border};
     border-radius: 10px; padding: 8px 10px; selection-background-color: {accent};
+    selection-color: {on_accent};
 }}
 QTextEdit#composer:focus, QLineEdit:focus {{ border-color: {accent}; }}
 
@@ -189,29 +343,50 @@ QTabBar::tab {{
     background: transparent; padding: 7px 14px; margin-right: 2px;
     border-top-left-radius: 8px; border-top-right-radius: 8px; color: {muted};
 }}
+QTabBar::tab:hover:!selected {{ color: {text}; }}
 QTabBar::tab:selected {{ background: {raised}; color: {text}; }}
 
 QComboBox, QSpinBox, QDoubleSpinBox {{
     background: {panel}; border: 1px solid {border};
     border-radius: 8px; padding: 5px 8px; min-height: 20px;
 }}
+QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{ border-color: {accent}; }}
 QComboBox QAbstractItemView {{
-    background: {panel}; border: 1px solid {border}; selection-background-color: {accent};
+    background: {panel}; border: 1px solid {border};
+    selection-background-color: {accent}; selection-color: {on_accent};
+    outline: none;
 }}
-QCheckBox::indicator {{
-    width: 16px; height: 16px; border-radius: 5px;
-    border: 1px solid {border}; background: {panel};
-}}
-QCheckBox::indicator:checked {{ background: {accent}; border-color: {accent}; }}
+{indicators}
+{arrows}
 
 QSlider::groove:horizontal {{ height: 4px; background: {border}; border-radius: 2px; }}
 QSlider::handle:horizontal {{
     background: {accent}; width: 14px; margin: -6px 0; border-radius: 7px;
 }}
+QSlider::sub-page:horizontal {{ background: {accent}; border-radius: 2px; }}
 QToolTip {{
     background: {panel}; color: {text};
     border: 1px solid {border}; padding: 4px 6px;
 }}
-QDialog, QMenu {{ background: {bg}; }}
-QMenu::item:selected {{ background: {accent}; color: #ffffff; }}
+QDialog {{ background: {bg}; }}
+
+/* The tray and orb menu. It is the only Toony surface some sessions ever see,
+   so it gets the same care as the window. */
+QMenu {{
+    background: {panel};
+    border: 1px solid {border};
+    border-radius: 10px;
+    padding: 6px 4px;
+}}
+QMenu::item {{
+    padding: 7px 24px 7px 34px;
+    border-radius: 7px;
+    margin: 1px 4px;
+    color: {text};
+}}
+QMenu::item:selected {{ background: {accent}; color: {on_accent}; }}
+QMenu::item:disabled {{ color: {muted}; background: transparent; }}
+QMenu::icon {{ left: 10px; }}
+QMenu::separator {{ height: 1px; background: {border}; margin: 5px 12px; }}
+QMenu#status::item:disabled {{ font-weight: 600; color: {muted}; }}
 """

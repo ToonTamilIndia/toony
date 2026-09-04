@@ -13,10 +13,14 @@ import uuid
 
 from .agent import Agent
 from .audio.bargein import build as build_bargein
-from .audio.capture import AudioUnavailable, Microphone
+from .audio.capture import AudioUnavailable, Microphone, MicrophonePool
+from .audio.hotkey import build as build_hotkey
 from .audio.playback import Player
+from .automation import Scheduler, Watcher
 from .brain import build_brain
 from .brain.base import BrainError
+from .brain.ollama import WarmKeeper
+from .brain.router import build as build_router
 from .config import Config
 from .history import store_for
 from .ipc import ControlServer
@@ -42,7 +46,9 @@ class Assistant:
         self.turns = 0
 
         self.player = Player(config)
-        self.brain = build_brain(config)
+        # The router, not a single backend: picking Claude on a laptop should
+        # not mean silence on a train. See toony/brain/router.py.
+        self.brain = build_router(config, announce=self._announce)
         self.stt = build_stt(config)
         self.tts = build_tts(config)
         self.voice = Speaker.from_config(self.tts, self.player, config)
@@ -53,6 +59,13 @@ class Assistant:
         self.agent.resume()
 
         self.wakeword = self._build_wakeword(config)
+        # One microphone, opened once. Reopening it per turn is where the first
+        # syllable of every sentence used to go.
+        self.mics = MicrophonePool(config)
+        self.hotkey = None
+        self.warmer = WarmKeeper(config, model_of=self._local_model)
+        self.routines = Scheduler(config, self._run_routine, publish=self.publish)
+        self.watcher = Watcher(config, self.routines.fire)
 
         self._server = ControlServer(self._handle)
         self._running = threading.Event()
@@ -67,6 +80,15 @@ class Assistant:
         self._chat_conversations: dict[str, str] = {}
         # Permission questions waiting on an answer from the GUI.
         self._pending: dict[str, queue.Queue] = {}
+        # When the key went down, so the time to the first recorded sample can
+        # be measured rather than guessed at.
+        self._requested_at = 0.0
+        # Set when a turn begins because the user talked over Toony: the
+        # pre-roll buffer then holds Toony's own reply, not theirs.
+        self._from_barge_in = False
+        self._last_tap = 0.0
+        # Hold mode only: whether the talk key is down right now.
+        self._key_down = False
 
     # ---- state, published as it changes ----------------------------------
     @property
@@ -90,6 +112,46 @@ class Assistant:
         except Exception:
             log.debug("could not publish %s", event, exc_info=True)
 
+    def _run_routine(self, routine) -> str:
+        """One routine, in its own conversation.
+
+        Its own, because a briefing that ran at eight should not be sitting in
+        the history when you ask something at ten — and because the routine's
+        own answer is not something you said.
+        """
+        with self._turn_lock:
+            previous = self.agent.conversation.id
+            self.agent.persist()
+            self.agent.start_new(f"Routine · {routine.name}")
+            self.state = "thinking"
+            try:
+                reply = self._run_agent(routine.prompt)
+            finally:
+                self.state = "idle"
+                self.agent.persist()
+                self.agent.open(previous)
+
+        if reply and routine.speak and not self.routines.in_quiet_hours():
+            self.say(reply)
+        return reply
+
+    def _announce(self, message: str) -> None:
+        """The brain router changed backend. Worth knowing, not worth a speech."""
+        self.last_error = message
+        self.publish("brain", message=message, brain=getattr(self.brain, "name", ""))
+
+    def _local_model(self) -> str:
+        """Which Ollama model to keep loaded — whichever one is actually in use."""
+        routes = getattr(self.brain, "routes", None)
+        if routes:
+            for route in routes:
+                if route.provider == "ollama":
+                    return route.model
+            return ""
+        if str(self.config.get("brain.provider", "")).lower() == "ollama":
+            return str(getattr(self.brain, "model", ""))
+        return ""
+
     def _on_tool(self, name: str, arguments: dict, output: str,
                  is_error: bool) -> None:
         self.publish("tool", tool=name, arguments=arguments,
@@ -101,10 +163,17 @@ class Assistant:
         self._server.start()
         self._start_telegram()
         self._warm()
+        self._start_hotkey()
+        self.routines.start()
+        self.watcher.start()
         self._audio_thread = threading.Thread(target=self._audio_loop,
                                               name="toony-audio", daemon=True)
         self._audio_thread.start()
         self.state = "idle"
+        # After the state is idle, so a startup routine finds a working
+        # assistant rather than one still calling itself "starting".
+        threading.Thread(target=self.routines.fire, args=("startup",),
+                         name="toony-startup", daemon=True).start()
         log.info("%s is ready (brain=%s, stt=%s, tts=%s, wake word=%s)",
                  self.config.get("general.name", "Toony"),
                  self.config.get("brain.provider"), self.stt.name, self.tts.name,
@@ -122,8 +191,40 @@ class Assistant:
         """Called from the wake word thread; it has already paused itself."""
         self._turn_requested.set()
 
+    def _start_hotkey(self) -> None:
+        """Watch the talk key ourselves if we are allowed to.
+
+        Both edges and about ten milliseconds, against one edge and a hundred
+        through the compositor. When it is not possible the KDE shortcut still
+        works, and `toony ptt --status` says why.
+        """
+        try:
+            self.hotkey = build_hotkey(self.config, self._on_key_down,
+                                       self._on_key_up)
+            if self.hotkey is not None:
+                self.hotkey.start()
+        except Exception as exc:
+            log.info("push-to-talk stays on the desktop shortcut: %s", exc)
+            self.hotkey = None
+
+    def _on_key_down(self) -> None:
+        """The talk key went down — from evdev, so this is the real moment."""
+        self._handle({"command": "listen", "edge": "press", "source": "evdev"})
+
+    def _on_key_up(self) -> None:
+        self._handle({"command": "listen", "edge": "release", "source": "evdev"})
+
     def _warm(self) -> None:
         """Load models now so the first question is not the slow one."""
+        # Ollama drops a model five minutes after the last request; the first
+        # question after that pays the load. This keeps it resident while Toony
+        # is in use. It runs in the background: it can take twenty seconds and
+        # nothing else has to wait for it.
+        self.warmer.start()
+        # And the microphone, so the first key press does not pay for opening
+        # a PortAudio stream on top of everything else.
+        if self.mics.warm():
+            log.debug("microphone stream held open")
         for component in (self.stt, self.tts):
             try:
                 component.warm()
@@ -155,6 +256,12 @@ class Assistant:
         self.voice.stop()
         if self.wakeword is not None:
             self.wakeword.stop()
+        if self.hotkey is not None:
+            self.hotkey.stop()
+        self.routines.stop()
+        self.watcher.stop()
+        self.warmer.stop()
+        self.mics.close()
         self._server.stop()
         log.info("stopped after %d turns", self.turns)
 
@@ -209,23 +316,34 @@ class Assistant:
 
     # ---- the microphone thread -------------------------------------------
     def _audio_loop(self) -> None:
-        """Wait for a turn request — from the hotkey or from the wake word."""
+        """Wait for a turn request — from the hotkey or from the wake word.
+
+        The microphone is not opened here any more. It is opened once at
+        startup and kept, so the work between the key press and the first
+        recorded sample is a thread wake-up and nothing else.
+        """
         while self._running.is_set():
             try:
                 if not self._turn_requested.wait(0.5):
+                    # Nothing is happening. A good moment to hand the device
+                    # back if it has been unused for a while.
+                    self.mics.reap()
                     continue
                 self._turn_requested.clear()
                 if self.wakeword is not None:
                     self.wakeword.pause()  # do not let Toony hear itself
                 try:
-                    with Microphone(self.config) as mic:
-                        self._run_turn(mic)
+                    self._run_turn(self.mics.acquire())
                 finally:
+                    self.mics.release()
                     if self.wakeword is not None:
                         self.wakeword.resume()
             except AudioUnavailable as exc:
                 self.last_error = str(exc)
                 log.error("%s — retrying in 5s", exc)
+                # The device may have been unplugged or taken; make the next
+                # attempt re-resolve it rather than reuse a dead handle.
+                self.mics.reset()
                 time.sleep(5)
             except Exception:
                 log.exception("audio loop crashed — continuing")
@@ -238,15 +356,34 @@ class Assistant:
         try:
             self.state = "listening"
             self._stop_listening.clear()
+            if (str(self.config.get("ptt.mode", "toggle")) == "hold"
+                    and not self._key_down):
+                # Released before we got here. Take the pre-roll and stop.
+                self._stop_listening.set()
+            # The chime is played after recording has been armed, not before:
+            # the pre-roll buffer means the microphone has been listening the
+            # whole time anyway, and a chime that has to finish first is a
+            # quarter of a second of the user waiting to be allowed to talk.
             if self.config.get("audio.start_chime", True):
                 self.player.chime("start")
+            if self._requested_at:
+                log.info("listening %.0fms after the key press",
+                         (time.monotonic() - self._requested_at) * 1000)
+                self._requested_at = 0.0
 
-            pcm = mic.record_utterance(stop_event=self._stop_listening)
+            # After barge-in the pre-roll holds Toony's own voice coming back
+            # through the microphone, not the user's.
+            barged, self._from_barge_in = self._from_barge_in, False
+            if barged:
+                mic.clear_preroll()
+            pcm = mic.record_utterance(stop_event=self._stop_listening,
+                                       use_preroll=not barged)
             if not pcm:
                 log.info("nothing was said")
                 return
 
             self.state = "thinking"
+            self.warmer.touch()
             try:
                 transcript = self.stt.transcribe(pcm, mic.sample_rate)
             except STTError as exc:
@@ -313,6 +450,7 @@ class Assistant:
         self.publish("interrupted", by="voice")
         if self.config.get("audio.barge_in_starts_turn", True):
             # They talked over it because they had something to say. Listen.
+            self._from_barge_in = True
             self._turn_requested.set()
 
     def _run_agent(self, text: str, on_text=None) -> str:
@@ -382,16 +520,20 @@ class Assistant:
         """Ask out loud, then listen for a yes or a no."""
         self.say(question, interruptible=False)
         try:
-            with Microphone(self.config) as mic:
-                # A yes or a no, not a monologue: give up quickly if nothing
-                # comes rather than recording for the full utterance length.
-                pcm = mic.record_utterance(wait_for_speech=True, max_seconds=6.0,
-                                           lead_in_s=5.0)
-                if not pcm:
-                    log.info("no answer to the confirmation prompt — treating "
-                             "silence as no")
-                    return False
-                answer = self.stt.transcribe(pcm, mic.sample_rate).text
+            mic = self.mics.acquire()
+            # The pre-roll holds the question Toony just asked, coming back
+            # through the microphone. Answering itself would be a poor way to
+            # ask permission.
+            mic.clear_preroll()
+            # A yes or a no, not a monologue: give up quickly if nothing
+            # comes rather than recording for the full utterance length.
+            pcm = mic.record_utterance(wait_for_speech=True, max_seconds=6.0,
+                                       lead_in_s=5.0, use_preroll=False)
+            if not pcm:
+                log.info("no answer to the confirmation prompt — treating "
+                         "silence as no")
+                return False
+            answer = self.stt.transcribe(pcm, mic.sample_rate).text
         except (AudioUnavailable, STTError) as exc:
             log.warning("could not hear a confirmation: %s", exc)
             return False
@@ -415,10 +557,17 @@ class Assistant:
 
     def _cmd_status(self, request: dict) -> dict:
         provider = str(self.config.get("brain.provider"))
+        configured = f"{provider}:{self.config.get(f'brain.{provider}.model')}"
+        routing = getattr(self.brain, "status", None)
         return {"ok": True, "state": self.state, "turns": self.turns,
                 "uptime_s": round(time.monotonic() - self.started_at, 1),
-                "brain": f"{provider}:{self.config.get(f'brain.{provider}.model')}",
+                # What is answering right now, which after a failover is not
+                # the same thing as what the config says.
+                "brain": getattr(self.brain, "name", configured) or configured,
+                "brain_configured": configured,
+                "routing": routing() if callable(routing) else None,
                 "stt": self.stt.name, "tts": self.tts.name,
+                "ptt": self._ptt_status(),
                 "wakeword": bool(self.wakeword and self.wakeword.active),
                 "history_messages": len(self.agent.history),
                 "conversation": self.agent.conversation.id,
@@ -426,24 +575,72 @@ class Assistant:
                 "windows": self._server.subscribers if self._server else 0,
                 "telegram": (self.telegram.status() if self.telegram
                              else {"running": False}),
+                "routines": self.routines.status(),
                 "sudo": bool(self.config.get("tools.sudo.enabled", False)),
                 "tools": len(self.agent.tools()),
                 "last_error": self.last_error}
 
+    def _ptt_status(self) -> dict:
+        return {"engine": "evdev" if (self.hotkey and self.hotkey.active)
+                          else "shortcut",
+                "mode": str(self.config.get("ptt.mode", "toggle")),
+                "shortcut": str(self.config.get("ptt.shortcut", "")),
+                "presses": getattr(self.hotkey, "presses", 0),
+                "mic_open": self.mics.is_open,
+                "preroll_ms": int(self.config.get("audio.preroll_ms", 700))}
+
     def _cmd_listen(self, request: dict) -> dict:
-        """Push-to-talk. In toggle mode a second press ends the utterance."""
+        """Push-to-talk.
+
+        Three ways in, and they have to agree with each other:
+
+        * ``toony listen`` from the KDE shortcut, which only ever reports a
+          press because a command shortcut has no release to report,
+        * the evdev listener, which reports both edges properly,
+        * the GUI, clicking the orb.
+
+        In toggle mode a second press ends the utterance. In hold mode the
+        release does — which is why hold mode needs the evdev engine, and says
+        so rather than silently never stopping.
+        """
         mode = str(self.config.get("ptt.mode", "toggle"))
         edge = str(request.get("edge", "press"))
+        now = time.monotonic()
+
+        if edge == "release":
+            if mode != "hold":
+                return {"ok": True, "action": "ignored"}
+            # Unconditional, because a quick tap releases the key before the
+            # audio thread has even woken up. _run_turn checks _key_down after
+            # it clears the flag, so the stop is not lost in that gap — and
+            # what the user managed to say still arrives, out of the pre-roll.
+            self._key_down = False
+            self._stop_listening.set()
+            return {"ok": True, "action": "stopped listening"}
 
         if self.state == "speaking":
             self.voice.stop()  # barge-in
+            self._interrupted = True
+            self.publish("interrupted", by="key")
             return {"ok": True, "action": "interrupted"}
-        if mode == "hold" and edge == "release":
+
+        if self.state == "listening":
+            # A quick second tap means "forget it" rather than "that's my
+            # sentence" — the recovery for pressing the key by accident.
+            double = (bool(self.config.get("ptt.double_tap_cancel", True))
+                      and (now - self._last_tap) * 1000
+                      < float(self.config.get("ptt.double_tap_ms", 400)))
+            self._last_tap = now
             self._stop_listening.set()
+            if double:
+                self._turn_requested.clear()
+                self.publish("cancelled", by="double tap")
+                return {"ok": True, "action": "cancelled"}
             return {"ok": True, "action": "stopped listening"}
-        if self.state == "listening" and mode == "toggle":
-            self._stop_listening.set()
-            return {"ok": True, "action": "stopped listening"}
+
+        self._last_tap = now
+        self._requested_at = now
+        self._key_down = True
         self._turn_requested.set()
         # Hand the compositor's activation token straight through: it is
         # short-lived and single-use, and only a window can spend it.
@@ -598,7 +795,7 @@ class Assistant:
         previous = self.config
         try:
             if fresh.section("brain") != previous.section("brain"):
-                self.brain = build_brain(fresh)
+                self.brain = build_router(fresh, announce=self._announce)
             if fresh.section("stt") != previous.section("stt"):
                 self.stt = build_stt(fresh)
             if fresh.section("tts") != previous.section("tts"):
@@ -619,9 +816,33 @@ class Assistant:
         # The vision model is cached per-context; a config change must drop it.
         self.agent.ctx.state.pop("vision", None)
 
+        # Which tools exist, and which binaries are on PATH, are both cached
+        # for speed. A reload is exactly when they might have changed.
+        from .tools.proc import forget_which
+        from .tools.registry import REGISTRY
+
+        forget_which()
+        REGISTRY.forget()
+
         if self.wakeword is not None:
             self.wakeword.stop()
         self.wakeword = self._build_wakeword(fresh)
+
+        if fresh.section("audio") != previous.section("audio"):
+            self.mics.reset()
+        self.mics.config = fresh
+        self.warmer.config = fresh
+        if fresh.section("ptt") != previous.section("ptt"):
+            if self.hotkey is not None:
+                self.hotkey.stop()
+                self.hotkey = None
+            self._start_hotkey()
+
+        self.routines.config = fresh
+        self.watcher.config = fresh
+        self.routines.reload()
+        if self.routines.routines and self.routines._thread is None:
+            self.routines.start()
 
         if fresh.section("telegram") != previous.section("telegram"):
             if self.telegram is not None:

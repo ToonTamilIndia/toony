@@ -238,6 +238,116 @@ class TestNewTools(unittest.TestCase):
                     self.assertIn(required, tool.schema["properties"])
 
 
+class TestLaunchingApplications(unittest.TestCase):
+    """Opening Firefox used to report success whatever happened.
+
+    ``spawn`` threw stderr away and never looked at the exit status, so a
+    launcher that refused still produced "Opened Firefox." — and there was
+    nothing in the reply, or the log, to say otherwise.
+    """
+
+    def setUp(self):
+        from toony.tools import proc
+
+        self.proc = proc
+        self.previous, proc._SCOPE = proc._SCOPE, False   # no systemd in tests
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        self.proc._SCOPE = self.previous
+
+    def test_a_command_that_works_is_not_an_error(self):
+        self.proc.launch(["/bin/true"], "the true command", settle=5.0)
+
+    def test_a_command_that_fails_is_reported_with_its_own_words(self):
+        script = "echo 'Failed to launch: no such application' >&2; exit 1"
+        with self.assertRaises(self.proc.CommandError) as caught:
+            self.proc.launch(["/bin/sh", "-c", script], "Firefox", settle=5.0)
+        self.assertIn("no such application", str(caught.exception))
+
+    def test_a_missing_launcher_says_so(self):
+        with self.assertRaises(self.proc.CommandError) as caught:
+            self.proc.launch(["definitely-not-installed-xyz"], "Firefox")
+        self.assertIn("not installed", str(caught.exception))
+
+    def test_something_still_running_counts_as_launched(self):
+        """A browser does not exit; waiting for it would hang the assistant."""
+        self.proc.launch(["/bin/sh", "-c", "sleep 1"], "Firefox", settle=0.2)
+
+
+class TestDesktopEntries(unittest.TestCase):
+    def setUp(self):
+        from toony.tools import applications
+
+        self.applications = applications
+
+    def test_field_codes_are_stripped_from_an_exec_line(self):
+        self.assertEqual(self.applications._command("firefox %u"), "firefox")
+        self.assertEqual(self.applications._command("gimp-2.10 %U"), "gimp-2.10")
+
+    def test_an_escaped_percent_survives(self):
+        """%% is a literal percent, not a field code."""
+        self.assertEqual(self.applications._command("brightness 50%% --now"),
+                         "brightness 50% --now")
+
+    def test_quoted_arguments_are_not_split_on_their_spaces(self):
+        entry = {"id": "editor", "name": "Editor", "path": "/tmp/editor.desktop",
+                 "exec": 'flatpak run --command="my editor" org.x.Editor'}
+        commands = self.applications._candidates(entry)
+        self.assertIn(["flatpak", "run", "--command=my editor", "org.x.Editor"],
+                      commands)
+
+    def test_the_desktop_file_launchers_are_tried_before_the_raw_exec_line(self):
+        """They honour the whole entry: working directory, terminal, D-Bus."""
+        entry = {"id": "firefox", "name": "Firefox", "exec": "firefox",
+                 "path": "/usr/share/applications/firefox.desktop"}
+        commands = self.applications._candidates(entry)
+        self.assertTrue(commands, "there should be at least the Exec line")
+        self.assertEqual(commands[-1], ["firefox"])
+        for argv in commands[:-1]:
+            self.assertIn(argv[0].rsplit("/", 1)[-1],
+                          ("gio", "kioclient6", "kioclient", "gtk-launch"))
+
+    def test_an_entry_with_no_exec_line_and_no_launcher_is_honest(self):
+        entry = {"id": "ghost", "name": "Ghost", "exec": "",
+                 "path": "/nowhere/ghost.desktop"}
+        original = self.applications.which
+        self.applications.which = lambda binary: None
+        original_any = self.applications.any_of
+        self.applications.any_of = lambda *binaries: None
+        try:
+            self.assertEqual(self.applications._candidates(entry), [])
+            with self.assertRaises(self.applications.CommandError) as caught:
+                self.applications._launch_entry(entry)
+        finally:
+            self.applications.which = original
+            self.applications.any_of = original_any
+        self.assertIn("no way to launch", str(caught.exception))
+
+    def test_the_index_is_reread_when_an_application_is_installed(self):
+        """It used to be cached for ever, so a new app stayed invisible."""
+        folder = Path(tempfile.mkdtemp())
+        original = self.applications._XDG_DIRS
+        self.applications._XDG_DIRS = [folder]
+        self.applications._CACHE = None
+        try:
+            self.assertEqual(self.applications._index(), [])
+            (folder / "zed.desktop").write_text(
+                "[Desktop Entry]\nType=Application\nName=Zed\nExec=zed %U\n")
+            names = [e["name"] for e in self.applications._index()]
+        finally:
+            self.applications._XDG_DIRS = original
+            self.applications._CACHE = None
+        self.assertEqual(names, ["Zed"])
+
+    def test_an_entry_whose_binary_is_gone_is_not_offered(self):
+        folder = Path(tempfile.mkdtemp())
+        (folder / "gone.desktop").write_text(
+            "[Desktop Entry]\nType=Application\nName=Gone\n"
+            "TryExec=/nowhere/gone\nExec=gone\n")
+        self.assertIsNone(self.applications._parse(folder / "gone.desktop"))
+
+
 class TestSystemReport(unittest.TestCase):
     def test_diagnose_produces_a_readable_briefing(self):
         from toony.tools.logs import diagnose_system

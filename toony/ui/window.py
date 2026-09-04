@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QFrame, QHBoxLayout, QLabel, QListWidget,
                                QWidget)
 
 from ..log import get
-from . import avatar, theme
+from . import avatar, icons, theme
 
 
 def _wayland() -> bool:
@@ -28,6 +28,19 @@ def _wayland() -> bool:
     return bool(app and app.platformName().startswith("wayland"))
 
 log = get("ui.window")
+
+_PIN_TIP = {
+    True: "Pinned to the desktop — click to unpin  (Ctrl+P)",
+    False: "Pin to the desktop: keep Toony in front, on every "
+           "virtual desktop  (Ctrl+P)",
+}
+
+# Only ever seen if the icon cache cannot be written: a named button beats a
+# blank one.
+_FALLBACK_TEXT = {
+    "menu": "≡", "new": "+", "settings": "…", "minimise": "–", "close": "x",
+    "pin": "P", "pin_off": "P", "mic": "Talk", "stop": "Stop", "send": "Send",
+}
 
 _STATUS = {
     "idle": ("Ready", "muted"),
@@ -91,6 +104,8 @@ class Composer(QTextEdit):
     """A text box that grows with the message and sends on Enter."""
 
     submitted = Signal(str)
+    #: True while there is something worth sending. The Send button follows it.
+    has_text = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -101,18 +116,24 @@ class Composer(QTextEdit):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setFixedHeight(42)
         self.textChanged.connect(self._grow)
+        self.textChanged.connect(
+            lambda: self.has_text.emit(bool(self.toPlainText().strip())))
 
     def _grow(self) -> None:
         height = int(self.document().size().height()) + 18
         self.setFixedHeight(max(42, min(140, height)))
 
+    def submit(self) -> None:
+        """Send what is typed, from Enter or from the Send button alike."""
+        text = self.toPlainText().strip()
+        if text:
+            self.clear()
+            self.submitted.emit(text)
+
     def keyPressEvent(self, event) -> None:
         enter = event.key() in (Qt.Key_Return, Qt.Key_Enter)
         if enter and not (event.modifiers() & (Qt.ShiftModifier | Qt.ControlModifier)):
-            text = self.toPlainText().strip()
-            if text:
-                self.clear()
-                self.submitted.emit(text)
+            self.submit()
             return
         super().keyPressEvent(event)
 
@@ -133,6 +154,10 @@ class ToonyWindow(QWidget):
         self.current_conversation = ""
         self.pending_confirm = ""
         self.busy = False
+        # ui.always_on_top is the old name for the same idea; honour it so an
+        # existing config keeps working.
+        self.pinned = bool(config.get("ui.pinned", False)
+                           or config.get("ui.always_on_top", False))
         self._thinking: Bubble | None = None
         self._live: Bubble | None = None
 
@@ -148,6 +173,8 @@ class ToonyWindow(QWidget):
         self._build()
         self.apply_style()
         self._wire()
+        self.pin_button.setChecked(self.pinned)
+        self._show_pin_state()
 
     # ---- construction -----------------------------------------------------
     def _build(self) -> None:
@@ -189,21 +216,34 @@ class ToonyWindow(QWidget):
         row.addLayout(names)
         row.addStretch(1)
 
-        self.sidebar_button = self._icon_button("☰", "Show or hide conversations")
-        self.new_button = self._icon_button("＋", "New conversation")
-        self.settings_button = self._icon_button("⚙", "Settings")
-        self.hide_button = self._icon_button("—", "Hide to the tray")
-        self.close_button = self._icon_button("✕", "Hide to the tray")
-        for button in (self.sidebar_button, self.new_button, self.settings_button,
-                       self.hide_button, self.close_button):
+        self.sidebar_button = self._icon_button("menu",
+                                                "Show or hide conversations")
+        self.new_button = self._icon_button("new", "New conversation")
+        self.pin_button = self._icon_button("pin_off", _PIN_TIP[False],
+                                            checkable=True)
+        self.settings_button = self._icon_button("settings", "Settings")
+        self.hide_button = self._icon_button("minimise", "Hide to the tray")
+        self.close_button = self._icon_button("close", "Hide to the tray")
+        for button in (self.sidebar_button, self.new_button, self.pin_button,
+                       self.settings_button, self.hide_button, self.close_button):
             row.addWidget(button)
         return header
 
-    def _icon_button(self, glyph: str, tip: str) -> QPushButton:
-        button = QPushButton(glyph, objectName="icon")
+    def _icon_button(self, shape: str, tip: str,
+                     checkable: bool = False) -> QPushButton:
+        """A header button. The artwork is SVG, not an emoji.
+
+        An emoji glyph is painted by the font in the font's own colours, so it
+        ignores ``color:`` and disappears the moment the button is hovered on
+        to the accent. A drawn shape takes the colour it is given.
+        """
+        button = QPushButton(objectName="icon")
         button.setToolTip(tip)
         button.setCursor(Qt.PointingHandCursor)
+        button.setCheckable(checkable)
         button.setFixedSize(30, 30)
+        button.setIconSize(QSize(17, 17))
+        button._shape = shape
         return button
 
     def _sidebar(self) -> QWidget:
@@ -236,11 +276,14 @@ class ToonyWindow(QWidget):
         footer.setContentsMargins(12, 6, 12, 12)
         footer.setSpacing(8)
         self.composer = Composer()
-        self.mic_button = QPushButton("🎙", objectName="mic")
-        self.mic_button.setToolTip("Talk to Toony (or press the global shortcut)")
-        self.mic_button.setCursor(Qt.PointingHandCursor)
+        self.mic_button = self._round_button("mic",
+                                             "Talk to Toony "
+                                             "(or press the global shortcut)")
+        self.send_button = self._round_button("send", "Send  (Enter)")
+        self.send_button.setEnabled(False)
         footer.addWidget(self.composer, 1)
         footer.addWidget(self.mic_button, 0, Qt.AlignBottom)
+        footer.addWidget(self.send_button, 0, Qt.AlignBottom)
 
         grip_row = QHBoxLayout()
         grip_row.setContentsMargins(0, 0, 4, 4)
@@ -250,6 +293,15 @@ class ToonyWindow(QWidget):
         column.addLayout(footer)
         column.addLayout(grip_row)
         return column
+
+    def _round_button(self, shape: str, tip: str) -> QPushButton:
+        button = QPushButton(objectName=shape)
+        button.setToolTip(tip)
+        button.setCursor(Qt.PointingHandCursor)
+        button.setFixedSize(40, 40)
+        button.setIconSize(QSize(20, 20))
+        button._shape = shape
+        return button
 
     def _permission_bar(self) -> QWidget:
         self.permission = QFrame(objectName="permission")
@@ -277,8 +329,11 @@ class ToonyWindow(QWidget):
         self.client.connected.connect(self.on_connected)
 
         self.composer.submitted.connect(self.send_text)
+        self.composer.has_text.connect(self.send_button.setEnabled)
+        self.send_button.clicked.connect(self.composer.submit)
         self.mic_button.clicked.connect(self.start_listening)
         self.new_button.clicked.connect(self.new_conversation)
+        self.pin_button.toggled.connect(self.set_pinned)
         self.sidebar_button.clicked.connect(self.toggle_sidebar)
         self.settings_button.clicked.connect(
             lambda: self.on_settings and self.on_settings())
@@ -294,6 +349,8 @@ class ToonyWindow(QWidget):
         QShortcut(QKeySequence("Ctrl+L"), self, self.start_listening)
         QShortcut(QKeySequence("Escape"), self, self.escape)
         QShortcut(QKeySequence("Ctrl+."), self, self.interrupt)
+        QShortcut(QKeySequence("Ctrl+P"), self,
+                  lambda: self.pin_button.toggle())
         QShortcut(QKeySequence("Ctrl+Comma"), self,
                   lambda: self.on_settings and self.on_settings())
 
@@ -301,11 +358,39 @@ class ToonyWindow(QWidget):
     def apply_style(self) -> None:
         accent = str(self.config.get("ui.accent", "#7c5cff"))
         self.set_opacity(self._opacity(), accent=accent)
-        self.setWindowFlag(Qt.WindowStaysOnTopHint,
-                           bool(self.config.get("ui.always_on_top", False)))
+        self._apply_icons(accent)
         self.avatar_label.setPixmap(avatar.circular_pixmap(
             36, str(self.config.get("ui.avatar_url", "")), accent,
             str(self.config.get("general.name", "T"))))
+
+    def _apply_icons(self, accent: str) -> None:
+        """Repaint the button artwork for the palette in force.
+
+        An SVG is baked at one colour, so switching theme or accent means new
+        files, not a restyle. They are cached, so this is cheap.
+        """
+        colours = theme.palette(str(self.config.get("ui.theme", "auto")), accent)
+        for button in (self.sidebar_button, self.new_button, self.pin_button,
+                       self.settings_button, self.hide_button, self.close_button):
+            self._set_icon(button, button._shape, colours["text"])
+        self._set_icon(self.mic_button,
+                       "stop" if self.busy else "mic", colours["on_accent"])
+        self._set_icon(self.send_button, "send", colours["on_accent"])
+
+    @staticmethod
+    def _set_icon(button: QPushButton, shape: str, colour: str) -> None:
+        """Give a button its picture, or its name if the artwork is missing.
+
+        A button with neither an icon nor a label is an unlabelled blank, which
+        is worse than a word — so the text fallback is not decorative.
+        """
+        button._shape = shape
+        drawn = icons.icon(shape, colour)
+        if drawn is None:
+            button.setText(_FALLBACK_TEXT.get(shape, ""))
+            return
+        button.setText("")
+        button.setIcon(drawn)
 
     def _opacity(self) -> float:
         try:
@@ -372,9 +457,12 @@ class ToonyWindow(QWidget):
         label, _ = _STATUS.get(state, (state.title(), "muted"))
         self.status_label.setText(label)
         self.busy = state in ("listening", "thinking", "speaking")
-        self.mic_button.setText("■" if self.busy else "🎙")
+        accent = str(self.config.get("ui.accent", "#7c5cff"))
+        on_accent = theme.palette(str(self.config.get("ui.theme", "auto")),
+                                  accent)["on_accent"]
+        self._set_icon(self.mic_button, "stop" if self.busy else "mic", on_accent)
         self.mic_button.setToolTip(
-            "Stop (Escape)" if self.busy
+            "Stop  (Escape)" if self.busy
             else "Talk to Toony (or press the global shortcut)")
 
     # ---- talking to the daemon --------------------------------------------
@@ -451,7 +539,47 @@ class ToonyWindow(QWidget):
             else:
                 self.interrupt()
             return
+        if self.pinned:
+            return          # pinned means pinned; Escape is not a trapdoor
         self.hide()
+
+    # ---- pinned to the desktop -------------------------------------------
+    def set_pinned(self, pinned: bool) -> None:
+        """Keep Toony in front, on every virtual desktop, until told otherwise.
+
+        Three things have to happen and only two of them are Qt's to give:
+        the stays-on-top flag (honoured on X11, ignored by every Wayland
+        compositor, which has no protocol for a client asking to be on top),
+        sticky-on-all-desktops (a window-manager call, so it is attempted
+        through wmctrl or kdotool and simply skipped when neither is there),
+        and the part that always works — a pinned window stops hiding itself
+        on Escape or on a tray click.
+        """
+        pinned = bool(pinned)
+        self.pinned = pinned
+        try:
+            self.config.set("ui.pinned", pinned)
+        except Exception:
+            log.debug("could not save the pinned state", exc_info=True)
+
+        visible = self.isVisible()
+        self.setWindowFlag(Qt.WindowStaysOnTopHint, pinned)
+        if visible:
+            # Changing a window flag re-creates the native window, which hides
+            # it. Put it back where the user left it.
+            self.show()
+            self.raise_()
+        self._show_pin_state()
+        _sticky(self.windowTitle(), pinned)
+
+    def _show_pin_state(self) -> None:
+        colours = theme.palette(str(self.config.get("ui.theme", "auto")),
+                                str(self.config.get("ui.accent", "#7c5cff")))
+        self._set_icon(self.pin_button, "pin" if self.pinned else "pin_off",
+                       colours["accent"] if self.pinned else colours["text"])
+        self.pin_button.setToolTip(_PIN_TIP[self.pinned])
+        if self.pin_button.isChecked() != self.pinned:
+            self.pin_button.setChecked(self.pinned)
 
     def new_conversation(self) -> None:
         self.clear_messages()
@@ -660,6 +788,9 @@ class ToonyWindow(QWidget):
     def toggle_visible(self, token: str = "") -> None:
         """From the tray, so this click is our own: activation is allowed."""
         if self.isVisible() and not self.isMinimized():
+            if self.pinned:
+                self.pop_up(token)      # pinned: bring it forward, never away
+                return
             self.hide()
         else:
             self.showNormal()
@@ -685,6 +816,33 @@ class ToonyWindow(QWidget):
             self.config.set("ui.height", self.height())
         except Exception:
             log.debug("could not save the window size", exc_info=True)
+
+
+def _sticky(title: str, on: bool) -> None:
+    """Ask the window manager to show this window on every virtual desktop.
+
+    Best effort by design. Qt has no API for it, so it goes through whichever
+    of wmctrl or kdotool is installed, and does nothing at all when neither is
+    — the rest of pinning still works, and a missing helper is not worth an
+    error in the user's face.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("wmctrl"):
+        argv = ["wmctrl", "-r", title, "-b",
+                f"{'add' if on else 'remove'},above,sticky"]
+    elif shutil.which("kdotool"):
+        argv = ["kdotool", "windowstate",
+                f"--{'add' if on else 'remove'}", "ABOVE", "--name", title]
+    else:
+        log.debug("no wmctrl or kdotool — pinning cannot reach the compositor")
+        return
+    try:
+        subprocess.run(argv, timeout=4, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.debug("could not ask the window manager to pin: %s", exc)
 
 
 def _tool_line(event: dict) -> str:

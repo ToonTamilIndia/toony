@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import configparser
-import functools
 import os
 import re
+import shlex
+import time
 from pathlib import Path
 
-from .proc import CommandError, any_of, spawn, which
+from ..log import get
+from .proc import CommandError, any_of, launch, which
 from .registry import ToolContext, tool
+
+log = get("tools.applications")
 
 _XDG_DIRS = [
     Path("~/.local/share/applications").expanduser(),
@@ -21,9 +25,42 @@ _XDG_DIRS = [
 ]
 
 
-@functools.lru_cache(maxsize=1)
+#: (fingerprint, read at, apps). None until the first read.
+_CACHE: tuple[tuple, float, list[dict[str, str]]] | None = None
+
+#: Re-read this often even when nothing looks changed, so an entry rewritten
+#: in place — a Flatpak update, say — is picked up too.
+_MAX_AGE_S = 60.0
+
+
+def _stamp() -> tuple:
+    """A cheap fingerprint of the application directories.
+
+    The index used to be cached for the life of the daemon, so an application
+    installed this afternoon stayed invisible until Toony was restarted.
+
+    Both halves earn their place: a directory's modification time changes when
+    anything is installed or removed, and the number of entries catches the
+    case where two changes land inside one tick of the filesystem's clock —
+    which is most of them, on a filesystem with one-second timestamps.
+    """
+    marks = []
+    for directory in _XDG_DIRS:
+        try:
+            marks.append((directory.stat().st_mtime_ns,
+                          sum(1 for _ in directory.glob("*.desktop"))))
+        except OSError:
+            marks.append((0, 0))
+    return tuple(marks)
+
+
 def _index() -> list[dict[str, str]]:
-    """Read every .desktop file once and keep the launchable ones."""
+    """Every launchable .desktop file, re-read whenever one is added."""
+    global _CACHE
+    stamp = _stamp()
+    if (_CACHE is not None and _CACHE[0] == stamp
+            and time.monotonic() - _CACHE[1] < _MAX_AGE_S):
+        return _CACHE[2]
     apps: dict[str, dict[str, str]] = {}
     for directory in _XDG_DIRS:
         if not directory.is_dir():
@@ -32,7 +69,8 @@ def _index() -> list[dict[str, str]]:
             entry = _parse(path)
             if entry and entry["id"] not in apps:
                 apps[entry["id"]] = entry
-    return list(apps.values())
+    _CACHE = (stamp, time.monotonic(), list(apps.values()))
+    return _CACHE[2]
 
 
 def _parse(path: Path) -> dict[str, str] | None:
@@ -51,14 +89,32 @@ def _parse(path: Path) -> dict[str, str] | None:
     name = section.get("Name", "").strip()
     if not name:
         return None
+    # TryExec names the binary that has to exist for the entry to be usable.
+    # Honouring it keeps leftover .desktop files from uninstalled packages out
+    # of the index, which is where half the "I opened it" lies came from.
+    try_exec = section.get("TryExec", "").strip()
+    if try_exec and not (which(try_exec) or Path(try_exec).exists()):
+        return None
     return {
         "id": path.stem,
         "name": name,
         "comment": section.get("Comment", "").strip(),
-        "exec": re.sub(r"%[fFuUdDnNickvm]", "", section.get("Exec", "")).strip(),
+        "exec": _command(section.get("Exec", "")),
         "keywords": section.get("Keywords", ""),
+        "terminal": section.get("Terminal", "false").strip().lower() == "true",
         "path": str(path),
     }
+
+
+def _command(line: str) -> str:
+    """An Exec= line with the field codes removed.
+
+    %% is a literal percent sign, so it has to come out of the way before the
+    codes are stripped or "50%%" turns into "50" plus whatever follows.
+    """
+    line = line.replace("%%", "\x00")
+    line = re.sub(r"%[fFuUdDnNickvm]", "", line)
+    return line.replace("\x00", "%").strip()
 
 
 def _score(entry: dict[str, str], query: str) -> int:
@@ -101,16 +157,66 @@ def open_application(ctx: ToolContext, name: str) -> str:
     if not entry:
         return (f"I could not find an application called {name}. "
                 "Use list_applications to see what is installed.")
-    launcher = any_of("gio", "gtk-launch", "kioclient6", "kioclient")
-    if launcher and launcher.endswith("gio"):
-        spawn(["gio", "launch", entry["path"]])
-    elif launcher and launcher.endswith("gtk-launch"):
-        spawn(["gtk-launch", entry["id"]])
-    elif entry["exec"]:
-        spawn(entry["exec"].split())
-    else:
-        raise CommandError(f"no way to launch {entry['name']}")
+    _launch_entry(entry)
     return f"Opened {entry['name']}."
+
+
+def _launch_entry(entry: dict) -> None:
+    """Start an application, trying each launcher until one actually works.
+
+    This used to pick a single launcher and assume it succeeded. If the chosen
+    one refused — no gio on the session bus, a .desktop id gtk-launch could not
+    resolve — nothing opened and Toony still said it had. Now every candidate
+    is tried in turn and only a run of failures is reported, with the reason
+    the last one gave.
+    """
+    reasons = []
+    for argv in _candidates(entry):
+        try:
+            launch(argv, entry["name"])
+            return
+        except CommandError as exc:
+            log.info("%s could not open %s: %s", argv[0], entry["name"], exc)
+            reasons.append(f"{os.path.basename(argv[0])}: {exc}")
+    if not reasons:
+        raise CommandError(f"there is no way to launch {entry['name']} on "
+                           "this machine — its desktop entry has no Exec line")
+    raise CommandError(f"{entry['name']} would not start. {reasons[-1]}")
+
+
+def _candidates(entry: dict) -> list[list[str]]:
+    """Every way we know of to start this entry, best first.
+
+    The .desktop-aware launchers come first because they honour the whole
+    entry — the working directory, Terminal=true, D-Bus activation — and the
+    raw Exec line is the last resort rather than the first guess.
+    """
+    argv: list[list[str]] = []
+    if which("gio"):
+        argv.append(["gio", "launch", entry["path"]])
+    kioclient = any_of("kioclient6", "kioclient")
+    if kioclient:
+        argv.append([kioclient, "exec", entry["path"]])
+    if which("gtk-launch"):
+        argv.append(["gtk-launch", entry["id"]])
+    if entry.get("exec"):
+        try:
+            command = shlex.split(entry["exec"])
+        except ValueError:
+            # An unbalanced quote in someone else's .desktop file is not worth
+            # failing over; the launchers above still had their turn.
+            command = entry["exec"].split()
+        if command:
+            argv.append(_in_terminal(command) if entry.get("terminal")
+                        else command)
+    return argv
+
+
+def _in_terminal(command: list[str]) -> list[str]:
+    """Wrap a Terminal=true entry, which cannot just be exec'd on its own."""
+    terminal = any_of("konsole", "x-terminal-emulator", "gnome-terminal",
+                      "xterm")
+    return [terminal, "-e", *command] if terminal else command
 
 
 @tool(description="List installed applications, optionally filtered by a search "

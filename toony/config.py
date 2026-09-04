@@ -45,6 +45,22 @@ DEFAULTS: dict[str, Any] = {
         # On a local model this is the difference between half a second and
         # thirty seconds of silence.
         "stream_from_start": True,
+        # What to do when the chosen provider cannot answer.
+        #   auto  - try it, then anything else that would work, local last
+        #   off   - only the chosen provider, and say so when it fails
+        #   list  - exactly these, in order, e.g. ["claude", "ollama"]
+        # This is what makes picking Claude safe on a laptop: no network means
+        # the local model answers instead of an apology.
+        "fallback": "auto",
+        # How long a backend that failed is rested before it is tried again.
+        # Doubles on repeat failures, so a provider that is properly gone stops
+        # costing a timeout on every question.
+        "fallback_cooldown_s": 90,
+        # Say out loud when the answer came from somewhere else than usual.
+        "announce_fallback": True,
+        # Use the best model that is actually installed, rather than failing
+        # because the one named below was never pulled.
+        "auto_model": True,
         "system_prompt": "",  # empty -> built-in prompt from brain/prompts.py
     },
     "brain.claude": {
@@ -72,6 +88,14 @@ DEFAULTS: dict[str, Any] = {
         "api_key": "ollama",                # Ollama ignores it, the client needs one
         "api_key_env": "",
         "max_tokens": 2048,
+        # Ollama unloads a model five minutes after the last request, so the
+        # first question after a break spends ten to twenty seconds loading
+        # weights before it starts thinking. These keep it resident while you
+        # are using Toony, and let it go when you are not.
+        "keep_warm": True,
+        "keep_alive": "30m",                # how long Ollama holds it
+        "warm_interval_s": 240,             # heartbeat, below keep_alive
+        "keep_warm_minutes": 90,            # stop the heartbeat after this idle
     },
     "vision": {
         # Looking at the screen. The brain is used when it can read images;
@@ -87,7 +111,11 @@ DEFAULTS: dict[str, Any] = {
         "initial_prompt": "",               # bias the decoder toward your vocabulary
     },
     "stt.local": {
-        "model": "small",                   # tiny | base | small | medium | large-v3
+        # auto | tiny | base | base.en | small | medium | large-v3
+        # "auto" is `small` on a GPU and `base.en` without one, because whisper
+        # is about twenty times slower on a CPU and `small` there is ten
+        # seconds of silence after every sentence.
+        "model": "auto",
         "device": "auto",                   # auto | cuda | cpu
         "compute_type": "auto",             # auto | float16 | int8_float16 | int8
         "beam_size": 1,
@@ -149,6 +177,17 @@ DEFAULTS: dict[str, Any] = {
         "barge_in_grace_ms": 600,           # ignore the first moment of speech
         # After cutting in, start listening straight away.
         "barge_in_starts_turn": True,
+        # Keep this much audio from *before* the key press. The hotkey travels
+        # through the compositor, a socket and a thread before recording
+        # starts, and without this the first syllable is simply gone. 0 to
+        # switch it off.
+        "preroll_ms": 700,
+        # Hold the input stream open between turns. Opening one costs 50-400ms,
+        # which is paid after the key press if it is not already open.
+        "keep_stream_open": True,
+        # Release the microphone after this long unused, so the recording
+        # indicator goes away and other apps can have it. 0 keeps it forever.
+        "stream_idle_s": 120,
     },
     "wakeword": {
         "enabled": False,
@@ -169,6 +208,18 @@ DEFAULTS: dict[str, Any] = {
         "enabled": True,
         "mode": "toggle",                   # toggle | hold
         "shortcut": "Meta+Space",           # registered as a KDE global shortcut
+        # How the key is watched.
+        #   shortcut - KDE global shortcut. No key-release event exists, so
+        #              "hold" cannot work; the compositor also adds latency.
+        #   evdev    - read the keyboard directly. Real press and release, and
+        #              about 10ms instead of 60-150ms. Needs membership of the
+        #              `input` group: toony ptt --setup
+        #   auto     - evdev when it is usable, otherwise the shortcut.
+        "engine": "auto",
+        "device": "",                       # evdev: "" picks every keyboard
+        # Tap it twice quickly to throw the turn away instead of sending it.
+        "double_tap_cancel": True,
+        "double_tap_ms": 400,
     },
     "tools": {
         "enabled": ["*"],                   # "*" = every registered tool
@@ -248,6 +299,20 @@ DEFAULTS: dict[str, Any] = {
         # Also say the answer out loud on the laptop. Usually you are not there.
         "speak_replies": False,
     },
+    "automation": {
+        # Things Toony does without being asked. Each routine is a trigger and
+        # a prompt; the prompt goes through the ordinary agent, so a routine
+        # can do exactly what you could have asked out loud and no more.
+        # Add one with: toony routine add
+        "enabled": True,
+        "routines": [],
+        "tick_s": 30,               # how often due routines are checked
+        "watch_s": 45,              # how often the battery and network are read
+        # Routines still run during these hours, they just do not speak.
+        # Example: "22:30-07:30". Empty means never quiet.
+        "quiet_hours": "",
+        "battery_low_percent": 20,
+    },
     "conversation": {
         # Conversations survive restarts and are listed in the GUI.
         "persist": True,
@@ -266,6 +331,12 @@ DEFAULTS: dict[str, Any] = {
         "height": 640,
         "start_minimised": True,            # live in the tray until called
         "tray": True,
+        # Pinned: kept in front of other windows and shown on every virtual
+        # desktop, and it stops hiding itself on Escape or a tray click.
+        # Toggle it with the pin in the title bar, Ctrl+P, or the tray menu.
+        "pinned": False,
+        # The old name for the same thing. Still honoured so an existing
+        # config keeps working; "pinned" is what gets written from now on.
         "always_on_top": False,
         # A custom title bar. Turn it off to get the normal KDE one, which is
         # the fix if dragging the window ever refuses to work.

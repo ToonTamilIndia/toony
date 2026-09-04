@@ -6,7 +6,7 @@ import os
 import time
 from pathlib import Path
 
-from .proc import CommandError, any_of, run, spawn, which
+from .proc import CommandError, any_of, launch, run, which
 from .registry import ToolContext, tool
 
 _HOME = Path.home()
@@ -81,8 +81,8 @@ def open_file(ctx: ToolContext, path: str) -> str:
     opener = any_of("xdg-open", "kde-open6", "kde-open", "gio")
     if not opener:
         raise CommandError("no desktop file opener found")
-    spawn([opener, "open", str(target)] if opener.endswith("gio")
-          else [opener, str(target)])
+    launch([opener, "open", str(target)] if opener.endswith("gio")
+           else [opener, str(target)], target.name)
     return f"Opened {target.name}."
 
 
